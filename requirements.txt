@@ -2,6 +2,8 @@ gymnasium
 numpy
 typing
 stable-baselines3
-pygame
+sb3-contrib
+pygame-ce
 tensorboard
 seaborn
+torch

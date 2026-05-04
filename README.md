@@ -183,3 +183,36 @@ O ambiente CPP possui renderização visual com as seguintes indicações:
 - **Branco**: células livres ainda não visitadas
 - **Texto no topo**: cobertura atual e número de passos
 
+## Improved CPP Agent — Generalization across grid sizes
+
+A detailed report on the strategy used to achieve near-100% coverage on 5x5, 10x10, and 20x20 grids is available in **[report_cpp.md](report_cpp.md)**.
+
+### Key Improvements
+
+- **RecurrentPPO (LSTM)** for trajectory memory under partial observability
+- **5x5 neighbor view** (expanded from 3x3) for better local awareness
+- **Directional exploration signals** pointing toward unexplored regions
+- **Custom CNN feature extractor** for spatial pattern recognition
+- **Curriculum learning pipeline** (5x5 → 10x10 → 20x20)
+- **Tuned hyperparameters** (gamma=0.995, 8 parallel envs, 3-10M timesteps)
+
+### Quick Start
+
+```bash
+# Setup
+python -m venv venv
+.\venv\Scripts\Activate.ps1  # Windows (or source venv/bin/activate on Linux)
+pip install -r requirements.txt
+
+# Train 5x5
+python train_grid_world_cpp.py train 5 3 150 3000000
+
+# Test 5x5 (auto-finds latest model)
+python train_grid_world_cpp.py test 5 3
+
+# Curriculum to 10x10
+python train_grid_world_cpp.py curriculum 10 12 500 5000000 data/<5x5_model_path>
+
+# Full automated pipeline (5x5 → 10x10 → 20x20)
+python train_curriculum_pipeline.py
+```
