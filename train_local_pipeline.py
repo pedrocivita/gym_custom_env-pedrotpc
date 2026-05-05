@@ -22,9 +22,9 @@ from train_grid_world_cpp import register_env, train_mode, test_mode
 # (size, obstacles, max_steps, total_timesteps, est_fps_per_env)
 # est_fps_per_env is rough; used to print an ETA before training starts.
 STAGES = {
-    5:  dict(obstacles=3,  max_steps=100,  total_timesteps=300_000,   fps_total=600),
-    10: dict(obstacles=12, max_steps=400,  total_timesteps=1_200_000, fps_total=350),
-    20: dict(obstacles=48, max_steps=1500, total_timesteps=2_000_000, fps_total=160),
+    5:  dict(obstacles=3,  max_steps=100,  total_timesteps=300_000,   fps_total=550),
+    10: dict(obstacles=12, max_steps=400,  total_timesteps=1_200_000, fps_total=240),
+    20: dict(obstacles=48, max_steps=1500, total_timesteps=1_500_000, fps_total=110),
 }
 
 

@@ -25,15 +25,21 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         in_channels = map_shape[0]
         h, w = map_shape[1], map_shape[2]
 
+        # Stride-2 in the second conv halves the spatial dim of the feature map,
+        # cutting the downstream linear layer by ~4x for larger grids.
+        # Output spatial size after conv2 with stride=2, kernel=3, padding=1 is
+        # floor((h + 2 - 3) / 2) + 1.
         self.map_cnn = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),
             nn.ReLU(),
             nn.Flatten(),
         )
 
-        cnn_out_dim = 64 * h * w
+        out_h = (h + 2 - 3) // 2 + 1
+        out_w = (w + 2 - 3) // 2 + 1
+        cnn_out_dim = 64 * out_h * out_w
 
         self.agent_mlp = nn.Sequential(
             nn.Linear(agent_dim, 64),
