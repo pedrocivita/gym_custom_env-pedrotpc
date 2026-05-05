@@ -100,9 +100,9 @@ Esses checkpoints são modelos completos — testáveis com `train_grid_world_cp
 
 | Grid | Full coverage (deterministic) | Full coverage (stochastic) |
 |------|-------------------------------|----------------------------|
-| 5×5 | preencher após `finalize.py` | preencher após `finalize.py` |
-| 10×10 | preencher após `finalize.py` | preencher após `finalize.py` |
-| 20×20 | preencher após `finalize.py` | preencher após `finalize.py` |
+| 5×5 | 44.0% | 87.0% |
+| 10×10 | 0.0% | 8.0% |
+| 20×20 | 0.0% | 0.0% |
 
 ---
 

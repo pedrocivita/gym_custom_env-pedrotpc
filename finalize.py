@@ -179,8 +179,9 @@ def git_commit_and_push(push: bool = True, dry_run: bool = False):
     ]
     msg = "\n".join(msg_lines)
 
+    # data/ is gitignored — only commit the human-facing files.
     cmds = [
-        ["git", "add", "report_cpp.md", "README.md", "data/finalize_results.json"],
+        ["git", "add", "report_cpp.md", "README.md"],
         ["git", "commit", "-m", msg],
     ]
     if push:
