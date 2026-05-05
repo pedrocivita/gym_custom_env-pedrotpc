@@ -14,6 +14,11 @@ import gymnasium as gym
 import numpy as np
 from datetime import datetime
 
+# Cap torch CPU threads early — with 12 vec envs in DummyVecEnv we already
+# saturate one core; letting torch fan out to all cores causes contention.
+import torch
+torch.set_num_threads(max(1, min(4, (os.cpu_count() or 4) // 4)))
+
 from gymnasium_env.grid_world_cpp import GridWorldCPPEnv
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
@@ -21,6 +26,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import CheckpointCallback
 
 from utils.feature_extractor import CustomCombinedExtractor
 
@@ -84,14 +90,18 @@ def get_policy_kwargs(features_dim=128):
 
 
 def create_model(env, ent_coef=0.01):
+    # Tuning aimed at CPU throughput on a 14-core box:
+    #   - larger n_steps (rollout) so updates are less frequent
+    #   - larger batch_size to cut minibatch overhead
+    #   - fewer epochs (6 instead of 10) to keep per-rollout wall-time down
     return MaskablePPO(
         "MultiInputPolicy",
         env,
         verbose=1,
         learning_rate=3e-4,
         n_steps=512,
-        batch_size=128,
-        n_epochs=10,
+        batch_size=256,
+        n_epochs=6,
         gamma=0.99,
         gae_lambda=0.95,
         ent_coef=ent_coef,
@@ -118,8 +128,9 @@ def train_mode(dim, obstacles, max_steps, total_timesteps):
     check_env(raw_env.unwrapped)
     raw_env.close()
 
-    n_envs = min(8, os.cpu_count() or 4)
-    print(f"Using {n_envs} parallel environments")
+    cpu = os.cpu_count() or 4
+    n_envs = min(12, max(2, cpu - 2))
+    print(f"Using {n_envs} parallel environments (cpu_count={cpu}, torch_threads={torch.get_num_threads()})")
 
     env_fns = [_make_env_factory(dim, obstacles, max_steps) for _ in range(n_envs)]
     from stable_baselines3.common.vec_env import DummyVecEnv
@@ -130,17 +141,31 @@ def train_mode(dim, obstacles, max_steps, total_timesteps):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = f"log/maskppo_cpp_{dim}_{obstacles}_{max_steps}_{timestamp}"
     model_path = f"data/maskppo_cpp_{dim}_{obstacles}_{max_steps}_{timestamp}"
+    ckpt_dir = f"{model_path}_checkpoints"
 
     os.makedirs("log", exist_ok=True)
     os.makedirs("data", exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     new_logger = configure(log_dir, ["stdout", "csv", "tensorboard"])
     model.set_logger(new_logger)
 
-    print(f"Starting training: {total_timesteps} timesteps...")
-    model.learn(total_timesteps=total_timesteps)
+    # Save a checkpoint roughly every 50k env-steps so a crash / power loss
+    # never costs more than that. save_freq is per-env, so multiply by n_envs.
+    save_freq_per_env = max(50_000 // n_envs, 1)
+    callback = CheckpointCallback(
+        save_freq=save_freq_per_env,
+        save_path=ckpt_dir,
+        name_prefix="ckpt",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+
+    print(f"Starting training: {total_timesteps} timesteps... (checkpoints every ~{save_freq_per_env * n_envs} steps)")
+    model.learn(total_timesteps=total_timesteps, callback=callback)
     model.save(model_path)
     print(f"Model saved to {model_path}.zip")
+    print(f"Checkpoints in {ckpt_dir}")
     print(f"Logs saved to {log_dir}")
 
     env.close()
