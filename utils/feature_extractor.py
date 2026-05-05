@@ -5,22 +5,35 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
 class CustomCombinedExtractor(BaseFeaturesExtractor):
+    """Feature extractor for the v3 CPP observation.
+
+    Inputs (Dict obs):
+      - "agent": (7,) float vector — pose + coverage + 4 directional ratios.
+      - "global_map": (3, H, W) float tensor — obstacle / visited / agent channels.
+
+    Outputs a `features_dim` vector that is fed into the actor & critic heads.
+    The CNN's output dimension is size-specific because each grid size
+    (5x5, 10x10, 20x20) is trained as its own model.
+    """
 
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 128):
         super().__init__(observation_space, features_dim)
 
-        neighbors_shape = observation_space["neighbors"].shape
+        map_shape = observation_space["global_map"].shape  # (C, H, W)
         agent_dim = observation_space["agent"].shape[0]
 
-        self.neighbor_cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+        in_channels = map_shape[0]
+        h, w = map_shape[1], map_shape[2]
+
+        self.map_cnn = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Flatten(),
         )
 
-        cnn_out_dim = 32 * neighbors_shape[0] * neighbors_shape[1]
+        cnn_out_dim = 64 * h * w
 
         self.agent_mlp = nn.Sequential(
             nn.Linear(agent_dim, 64),
@@ -33,11 +46,12 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
-        neighbors = observations["neighbors"].unsqueeze(1).float()
+        gmap = observations["global_map"].float()
+        # Already (B, C, H, W) — no need to unsqueeze.
         agent = observations["agent"].float()
 
-        neighbor_features = self.neighbor_cnn(neighbors)
+        map_features = self.map_cnn(gmap)
         agent_features = self.agent_mlp(agent)
 
-        combined = torch.cat([neighbor_features, agent_features], dim=1)
+        combined = torch.cat([map_features, agent_features], dim=1)
         return self.combine(combined)

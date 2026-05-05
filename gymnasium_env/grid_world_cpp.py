@@ -7,14 +7,20 @@ import pygame
 #
 # Coverage Path Planning (CPP) environment based on GridWorld with obstacles.
 #
-# The agent must visit as many free cells as possible while avoiding obstacles.
+# The agent must visit every free cell while avoiding obstacles.
 #
-# Observation space:
+# Observation space (v3):
 #   - "agent": 7 floats [norm_x, norm_y, coverage_ratio,
 #              unvisited_ratio_right, unvisited_ratio_up,
 #              unvisited_ratio_left, unvisited_ratio_down]
-#   - "neighbors": 5x5 matrix centered on agent
-#     (0=free/unvisited, 1=obstacle/wall, 2=visited)
+#   - "global_map": 3 x size x size float32 tensor with channels:
+#         channel 0 = obstacle_mask (1 where obstacle)
+#         channel 1 = visited_mask  (1 where already visited)
+#         channel 2 = agent_mask    (1 only at current agent position)
+#
+# Designed to be paired with MaskablePPO (sb3-contrib): the env exposes
+# action_masks() so the policy never selects an action that would walk into
+# a wall or obstacle.
 #
 
 class GridWorldCPPEnv(gym.Env):
@@ -28,35 +34,30 @@ class GridWorldCPPEnv(gym.Env):
         self.obstacles_locations = []
         self.count_steps = 0
         self.max_steps = max_steps
-        self.consecutive_revisits = 0
 
         self.visited = set()
 
         self._agent_location = np.array([-1, -1], dtype=int)
-        self._neighbors = np.zeros((5, 5), dtype=int)
 
-        # --- Cached structures (populated in reset()) ---
-        # Set of (x, y) tuples for O(1) obstacle lookup in step()
+        # Cached structures (populated in reset())
         self._obstacle_set: set = set()
-        # Boolean grid [size x size]: True where obstacle exists
-        # Used by set_neighbors() for fast slicing instead of per-cell any()
         self._obstacle_grid: np.ndarray = np.zeros((size, size), dtype=bool)
 
-        # Pre-built coordinate arrays for vectorized _get_directional_signals()
-        # xs[i,j] = i, ys[i,j] = j  (shape: size x size)
+        # Pre-built coordinate arrays for vectorised _get_directional_signals()
         _r = np.arange(size)
-        self._xs, self._ys = np.meshgrid(_r, _r, indexing='ij')  # shape (size, size)
+        self._xs, self._ys = np.meshgrid(_r, _r, indexing='ij')
 
         self.observation_space = gym.spaces.Dict({
             "agent": gym.spaces.Box(
                 low=np.zeros(7, dtype=np.float32),
                 high=np.ones(7, dtype=np.float32),
-                dtype=np.float32
+                dtype=np.float32,
             ),
-            "neighbors": gym.spaces.Box(
-                low=np.zeros((5, 5), dtype=np.float32),
-                high=np.full((5, 5), 2.0, dtype=np.float32),
-                dtype=np.float32
+            "global_map": gym.spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(3, size, size),
+                dtype=np.float32,
             ),
         })
 
@@ -82,31 +83,25 @@ class GridWorldCPPEnv(gym.Env):
     def coverage_ratio(self):
         return len(self.visited) / self.total_free_cells if self.total_free_cells > 0 else 1.0
 
-    def _get_directional_signals(self):
+    def _visited_grid(self) -> np.ndarray:
+        grid = np.zeros((self.size, self.size), dtype=bool)
+        if self.visited:
+            vis_arr = np.array(list(self.visited), dtype=int)
+            grid[vis_arr[:, 0], vis_arr[:, 1]] = True
+        return grid
+
+    def _get_directional_signals(self, visited_grid: Optional[np.ndarray] = None):
         ax, ay = self._agent_location
 
-        # free_mask: True for cells that are NOT obstacles — shape (size, size)
-        free_mask = ~self._obstacle_grid  # pre-built boolean grid
-
-        # Build a visited boolean grid on-the-fly from the visited set.
-        # For typical grid sizes (<=20) this is faster than maintaining a
-        # synchronized array because visited grows incrementally and the
-        # set iteration is cheap in Python relative to numpy overhead at
-        # small sizes; for larger grids the vectorised ops dominate anyway.
-        visited_grid = np.zeros((self.size, self.size), dtype=bool)
-        if self.visited:
-            vis_arr = np.array(list(self.visited), dtype=int)  # (n, 2)
-            visited_grid[vis_arr[:, 0], vis_arr[:, 1]] = True
-
-        # unvisited_free: cells that are free AND not yet visited
+        free_mask = ~self._obstacle_grid
+        if visited_grid is None:
+            visited_grid = self._visited_grid()
         unvisited_free = free_mask & ~visited_grid
 
-        # Directional masks using the pre-built coordinate grids
-        # self._xs[i,j] == i (x-coordinate), self._ys[i,j] == j (y-coordinate)
-        right_mask = self._xs > ax   # x > ax
-        up_mask    = self._ys < ay   # y < ay  (up = decreasing y)
-        left_mask  = self._xs < ax   # x < ax
-        down_mask  = self._ys > ay   # y > ay
+        right_mask = self._xs > ax
+        up_mask    = self._ys < ay
+        left_mask  = self._xs < ax
+        down_mask  = self._ys > ay
 
         signals = np.zeros(4, dtype=np.float32)
         for idx, dir_mask in enumerate((right_mask, up_mask, left_mask, down_mask)):
@@ -114,12 +109,18 @@ class GridWorldCPPEnv(gym.Env):
             total = region_free.sum()
             if total > 0:
                 signals[idx] = float((unvisited_free & dir_mask).sum()) / float(total)
-            # else stays 0.0
-
         return signals
 
+    def _build_global_map(self, visited_grid: np.ndarray) -> np.ndarray:
+        gmap = np.zeros((3, self.size, self.size), dtype=np.float32)
+        gmap[0] = self._obstacle_grid.astype(np.float32)
+        gmap[1] = visited_grid.astype(np.float32)
+        gmap[2, self._agent_location[0], self._agent_location[1]] = 1.0
+        return gmap
+
     def _get_obs(self):
-        dir_signals = self._get_directional_signals()
+        visited_grid = self._visited_grid()
+        dir_signals = self._get_directional_signals(visited_grid)
         return {
             "agent": np.array([
                 self._agent_location[0] / max(self.size - 1, 1),
@@ -130,7 +131,7 @@ class GridWorldCPPEnv(gym.Env):
                 dir_signals[2],
                 dir_signals[3],
             ], dtype=np.float32),
-            "neighbors": self._neighbors.astype(np.float32),
+            "global_map": self._build_global_map(visited_grid),
         }
 
     def _get_info(self):
@@ -142,51 +143,21 @@ class GridWorldCPPEnv(gym.Env):
             "size": self.size,
         }
 
-    def set_neighbors(self, obstacles_locations):
-        # Build the 5x5 neighbors matrix using array slicing on a padded grid
-        # rather than a Python double-loop + per-cell any(np.array_equal(...)).
-        #
-        # Grid encoding: 0 = free/unvisited, 1 = obstacle/wall, 2 = visited
-        # Padding with 1s represents out-of-bounds (wall).
-
+    def action_masks(self) -> np.ndarray:
+        # True for legal actions (cell exists and is not an obstacle).
+        # If the agent is fully boxed in, fall back to all-True so MaskablePPO
+        # can still sample an action; the env will leave the agent in place.
         ax, ay = self._agent_location
-
-        # Padded grid: (size+4) x (size+4), pre-filled with 1 (wall/OOB).
-        # Interior region [2 : size+2, 2 : size+2] corresponds to the real grid.
-        pad = 2
-        padded = np.ones((self.size + 2 * pad, self.size + 2 * pad), dtype=int)
-
-        # Mark free interior cells as 0
-        padded[pad:pad + self.size, pad:pad + self.size] = 0
-
-        # Mark obstacles as 1 (already 1 from padding, but set explicitly for interior)
-        if self._obstacle_set:
-            obs_arr = np.array(list(self._obstacle_set), dtype=int)  # (n_obs, 2)
-            padded[obs_arr[:, 0] + pad, obs_arr[:, 1] + pad] = 1
-
-        # Mark visited cells as 2
-        if self.visited:
-            vis_arr = np.array(list(self.visited), dtype=int)  # (n_vis, 2)
-            # Only mark if not an obstacle (obstacles stay as 1)
-            vis_x = vis_arr[:, 0] + pad
-            vis_y = vis_arr[:, 1] + pad
-            not_obs = padded[vis_x, vis_y] != 1
-            padded[vis_x[not_obs], vis_y[not_obs]] = 2
-
-        # Slice the 5x5 region centered on the agent.
-        # Agent is at (ax, ay) in the real grid → (ax + pad, ay + pad) in padded.
-        cx, cy = ax + pad, ay + pad
-        # matrix[i][j] where i is row (y-offset) and j is col (x-offset),
-        # matching the original loop: nx = ax + (j-2), ny = ay + (i-2)
-        self._neighbors = padded[cx - 2:cx + 3, cy - 2:cy + 3].T
-        # Note: padded is indexed [x, y]; the original matrix[i][j] = matrix[row, col]
-        # maps row→y-offset, col→x-offset, so we transpose to get [y_offset, x_offset].
+        mask = np.zeros(4, dtype=bool)
+        for action, direction in self._action_to_direction.items():
+            nx, ny = ax + direction[0], ay + direction[1]
+            if 0 <= nx < self.size and 0 <= ny < self.size and not self._obstacle_grid[nx, ny]:
+                mask[action] = True
+        if not mask.any():
+            mask[:] = True
+        return mask
 
     def _rebuild_obstacle_caches(self):
-        """Rebuild _obstacle_set and _obstacle_grid from self.obstacles_locations.
-
-        Called once per reset() after the obstacle list is finalised.
-        """
         self._obstacle_set = set(tuple(loc) for loc in self.obstacles_locations)
         self._obstacle_grid = np.zeros((self.size, self.size), dtype=bool)
         if self._obstacle_set:
@@ -198,13 +169,10 @@ class GridWorldCPPEnv(gym.Env):
         self.count_steps = 0
         self.obstacles_locations = []
         self.visited = set()
-        self.consecutive_revisits = 0
 
         self._agent_location = self.np_random.integers(0, self.size, size=2, dtype=int)
 
-        # Build obstacle set incrementally during placement (O(1) lookup).
         _tmp_obs_set: set = {tuple(self._agent_location)}
-
         for _ in range(self.obs_quantity):
             obstacle_location = self._agent_location.copy()
             while tuple(obstacle_location) in _tmp_obs_set:
@@ -212,12 +180,8 @@ class GridWorldCPPEnv(gym.Env):
             self.obstacles_locations.append(obstacle_location)
             _tmp_obs_set.add(tuple(obstacle_location))
 
-        # Commit obstacle caches (set + bool grid) once, for use throughout the episode.
         self._rebuild_obstacle_caches()
-
         self.visited.add(tuple(self._agent_location))
-
-        self.set_neighbors(self.obstacles_locations)
 
         observation = self._get_obs()
         info = self._get_info()
@@ -235,42 +199,30 @@ class GridWorldCPPEnv(gym.Env):
             self._agent_location + direction, 0, self.size - 1
         )
 
-        # O(1) obstacle check via cached set instead of O(n) any(np.array_equal(...))
         if tuple(self._agent_location) in self._obstacle_set:
             self._agent_location = old_location
 
-        self.set_neighbors(self.obstacles_locations)
         self.count_steps += 1
 
         current_pos = tuple(self._agent_location)
         is_new_cell = current_pos not in self.visited
-        stayed_in_place = np.array_equal(self._agent_location, old_location)
 
-        reward = -0.1
-
-        if stayed_in_place:
-            reward -= 0.5
-            self.consecutive_revisits += 1
-        elif is_new_cell:
+        # Reward shaping (v3): clean and bootstrap-friendly.
+        # Action masking removes "stuck" cases, so no stuck penalty needed.
+        # No truncation penalty — keeps value targets unbiased.
+        reward = -0.05  # mild step cost
+        if is_new_cell:
             reward += 1.0
             self.visited.add(current_pos)
-            self.consecutive_revisits = 0
         else:
-            penalty = 0.3 * (1.0 + self.consecutive_revisits * 0.1)
-            reward -= min(penalty, 1.0)
-            self.consecutive_revisits += 1
+            reward -= 0.25
 
         full_coverage = len(self.visited) >= self.total_free_cells
         terminated = full_coverage
+        truncated = self.count_steps >= self.max_steps and not terminated
 
         if full_coverage:
             reward += 10.0 * (self.size / 5.0)
-
-        if self.count_steps >= self.max_steps and not terminated:
-            truncated = True
-            reward -= 5.0
-        else:
-            truncated = False
 
         observation = self._get_obs()
         info = self._get_info()
