@@ -147,17 +147,7 @@ def train_mode(dim, obstacles, max_steps, total_timesteps):
     return model_path
 
 
-def test_mode(dim, obstacles, model_path):
-    max_steps = dim * dim * 4
-    print(f"--- Testing CPP Agent: {dim}x{dim}, {obstacles} obstacles, max_steps={max_steps} ---")
-    print(f"Loading model from {model_path}")
-
-    register_env()
-    model = MaskablePPO.load(model_path)
-
-    env = make_single_env(dim, obstacles, max_steps, render_mode="rgb_array")
-
-    num_episodes = 100
+def _run_test_episodes(env, model, num_episodes: int, deterministic: bool, label: str):
     full_coverage_count = 0
     total_coverages = []
     total_steps_list = []
@@ -170,7 +160,7 @@ def test_mode(dim, obstacles, model_path):
 
         while not done and not truncated:
             masks = get_action_masks(env)
-            action, _ = model.predict(obs, action_masks=masks, deterministic=True)
+            action, _ = model.predict(obs, action_masks=masks, deterministic=deterministic)
             obs, reward, done, truncated, info = env.step(int(action))
             steps += 1
 
@@ -179,30 +169,48 @@ def test_mode(dim, obstacles, model_path):
 
         if done and not truncated:
             full_coverage_count += 1
-            print(f"Episode {i+1}: Full coverage in {steps} steps.")
-        else:
-            print(f"Episode {i+1}: Coverage {info['coverage']:.1%} in {steps} steps.")
 
     full_coverage_rate = (full_coverage_count / num_episodes) * 100
-    avg_coverage = np.mean(total_coverages) * 100
-    std_coverage = np.std(total_coverages) * 100
-    avg_steps = np.mean(total_steps_list)
-    std_steps = np.std(total_steps_list)
+    avg_coverage = float(np.mean(total_coverages) * 100)
+    std_coverage = float(np.std(total_coverages) * 100)
+    avg_steps = float(np.mean(total_steps_list))
+    std_steps = float(np.std(total_steps_list))
 
-    print(f"\n--- Test Results ({dim}x{dim}) ---")
+    print(f"\n--- {label} ({deterministic=}) ---")
     print(f"Full Coverage Rate: {full_coverage_rate:.1f}% ({full_coverage_count}/{num_episodes})")
     print(f"Average Coverage: {avg_coverage:.1f}% (std: {std_coverage:.1f}%)")
     print(f"Coverage Range: [{np.min(total_coverages)*100:.1f}%, {np.max(total_coverages)*100:.1f}%]")
     print(f"Average Steps: {avg_steps:.1f} (std: {std_steps:.1f})")
     print(f"Steps Range: [{np.min(total_steps_list)}, {np.max(total_steps_list)}]")
 
-    env.close()
     return {
         "full_coverage_rate": full_coverage_rate,
         "avg_coverage": avg_coverage,
         "std_coverage": std_coverage,
         "avg_steps": avg_steps,
+        "std_steps": std_steps,
     }
+
+
+def test_mode(dim, obstacles, model_path, num_episodes: int = 100):
+    max_steps = dim * dim * 4
+    print(f"--- Testing CPP Agent: {dim}x{dim}, {obstacles} obstacles, max_steps={max_steps} ---")
+    print(f"Loading model from {model_path}")
+
+    register_env()
+    model = MaskablePPO.load(model_path)
+
+    env = make_single_env(dim, obstacles, max_steps, render_mode="rgb_array")
+
+    det = _run_test_episodes(env, model, num_episodes, True,  f"Deterministic ({dim}x{dim})")
+    sto = _run_test_episodes(env, model, num_episodes, False, f"Stochastic    ({dim}x{dim})")
+
+    env.close()
+    print(f"\n=== Summary {dim}x{dim} ===")
+    print(f"Deterministic: full={det['full_coverage_rate']:.1f}%  avg={det['avg_coverage']:.1f}%  steps={det['avg_steps']:.0f}")
+    print(f"Stochastic:    full={sto['full_coverage_rate']:.1f}%  avg={sto['avg_coverage']:.1f}%  steps={sto['avg_steps']:.0f}")
+
+    return {"deterministic": det, "stochastic": sto}
 
 
 def run_mode(dim, obstacles, model_path):

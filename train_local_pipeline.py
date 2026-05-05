@@ -107,10 +107,13 @@ def main():
     print("=" * 60)
     if results:
         for s, m in results.items():
+            det = m.get("deterministic", {})
+            sto = m.get("stochastic", {})
             print(
-                f"  {s}x{s}: full_coverage={m['full_coverage_rate']:.1f}% "
-                f"avg_coverage={m['avg_coverage']:.1f}% "
-                f"avg_steps={m['avg_steps']:.1f}"
+                f"  {s}x{s}: det full={det.get('full_coverage_rate', 0):.1f}%"
+                f" avg={det.get('avg_coverage', 0):.1f}% | "
+                f"stoch full={sto.get('full_coverage_rate', 0):.1f}%"
+                f" avg={sto.get('avg_coverage', 0):.1f}%"
             )
 
 
