@@ -1,187 +1,246 @@
-# Report: Coverage Path Planning with Generalization via Recurrent RL
+# Coverage Path Planning sob observabilidade parcial — Relatório
 
-**Author:** Pedro Civita  
-**Date:** May 2026  
-**Course:** Reinforcement Learning — Insper
+**Autor:** Pedro Civita
+**Disciplina:** Reinforcement Learning — Insper, 10º semestre (2026.1)
+**Entrega:** APS de RL, prazo 2026-05-08
+**Repositório:** https://github.com/pedrocivita/gym_custom_env-pedrotpc
 
 ---
 
-## 1. Introduction
+## 1. O problema
 
-Coverage Path Planning (CPP) is a classic planning problem where an agent must visit all accessible cells in a grid while avoiding obstacles. Applications include autonomous vacuums, precision agriculture drones, and patrol robots.
+O **Coverage Path Planning (CPP)** é o problema canônico em que um agente precisa visitar todas as células acessíveis de um ambiente discreto evitando obstáculos. Tem aplicações reais em aspiradores autônomos, drones agrícolas e robôs de patrulha.
 
-This report describes the strategy implemented to train an RL agent capable of achieving near-100% coverage on 5x5, 10x10, and 20x20 grid environments under **partial observability** — the agent cannot see the full map, only a local neighborhood and aggregate statistics about its exploration progress.
+A APS pede um agente RL que:
 
-## 2. Baseline Analysis
+1. Cubra ~100% das células livres em grids 5x5 (3 obstáculos) e 10x10 (12 obstáculos) — meta para nota 10.
+2. Cubra ~100% também em 20x20 (48 obstáculos) — bônus para nota 11.
+3. Mantenha **observabilidade parcial**: o agente não pode receber o mapa completo do ambiente. Só pode raciocinar sobre o que percebeu localmente e o que ele mesmo construiu durante a exploração.
 
-The original implementation uses **PPO with MultiInputPolicy** (a standard feedforward MLP). The observation space consists of:
-- Agent position (normalized x, y)
-- Coverage ratio (scalar)
-- 3x3 neighbor matrix (local view)
+A baseline fornecida (`PPO + MultiInputPolicy`, observação `[norm_x, norm_y, coverage] + 3x3` view, 1M timesteps, 1 env) atinge ~75-81% full-coverage em 5x5 e ~59-70% em 10x10 — bem aquém do alvo.
 
-### Baseline Results (from professor's tests)
+## 2. Diagnóstico da baseline
 
-| Grid | Full Coverage Rate | Notes |
-|------|-------------------|-------|
-| 5x5 | 69-81% | Inconsistent, fails ~20-30% of episodes |
-| 10x10 | 59-70% | Significant degradation from 5x5 |
+| Limitação | Consequência |
+|-----------|--------------|
+| **Sem memória**: política puramente reativa (MLP feedforward) | Em grids maiores o agente não lembra onde já passou e cai em loops |
+| **Visão 3x3** (9 células) | Em 10x10 enxerga ~10% do grid; em 20x20, ~2%. Não há sinal global |
+| **Sem direção do não-explorado** | A única info global é o `coverage_ratio` escalar, que diz *quanto* falta mas não *para onde ir* |
+| **Sem máscara de ação** | O agente desperdiça experiência tentando andar contra paredes |
+| **Compute baixo** | 1M timesteps com 1 env não é suficiente para grids 10x10+ |
 
-### Why the Baseline Fails
+Os três primeiros itens são os mais críticos: tornam o problema fundamentalmente subdeterminado para uma política reativa.
 
-1. **No memory**: The MLP policy is purely reactive — it processes each frame independently with no recollection of its trajectory. On larger grids, the agent cannot remember which regions it has already explored.
+## 3. Estratégia adotada (v3.1)
 
-2. **Tiny field of view**: A 3x3 window covers only 9 cells. On a 10x10 grid with ~88 free cells, this is ~10% visibility. The agent has no directional sense of where unexplored territory lies.
+A estratégia final combina três grandes mudanças, todas justificadas pelos itens acima e respeitando a restrição de observabilidade parcial.
 
-3. **No directional guidance**: The coverage ratio tells the agent *how much* is done but not *where* to go next.
+### 3.1 Memória explícita: `visited_map`
 
-4. **Insufficient training compute**: 1M timesteps with default hyperparameters is insufficient for learning robust coverage strategies.
+Em vez de pedir à rede que mantenha memória implícita via LSTM (custosa em CPU e frágil — ver Seção 5), o ambiente expõe um mapa binário do **histórico do próprio agente**:
 
-## 3. Methodology
+```
+"visited_map": Box(shape=(size, size), low=0, high=1, dtype=float32)
+    1 onde o agente já esteve, 0 caso contrário.
+```
 
-The implemented strategy combines six complementary improvements:
+Isso **não viola observabilidade parcial**: o conteúdo do mapa é gerado pelo próprio agente ao se mover. É análogo direto a um mapa de ocupação que um robô real constrói online via SLAM. O mapa nunca revela obstáculos não-explorados.
 
-### 3.1 Recurrent Policy (LSTM) — Primary Change
+A vantagem sobre LSTM: a memória é **gradiente-friendly** (CNN convolui sobre o canal espacial), não exige BPTT, e é determinística — eliminando o ponto de falha mais comum em RL recorrente.
 
-**Rationale:** The core problem is partial observability without memory. A recurrent neural network (LSTM) maintains hidden state across timesteps, giving the agent implicit memory of its trajectory. This is the single highest-impact change.
+### 3.2 Sensor local 5x5 + sinais direcionais
 
-**Implementation:** Replaced `PPO` with `RecurrentPPO` from `sb3-contrib`, using `MultiInputLstmPolicy`. Configuration:
-- LSTM hidden size: 128
-- 1 LSTM layer
-- Separate actor and critic LSTMs (`shared_lstm=False`, `enable_critic_lstm=True`)
+A observação completa é:
 
-### 3.2 Expanded Observation: 5x5 Neighbor View
+```
+"agent": (7,) — [norm_x, norm_y, coverage_ratio,
+                 unvisited_ratio_right, unvisited_up, unvisited_left, unvisited_down]
+"neighbors": (5, 5) — janela local centrada no agente
+                       0 = livre, 1 = parede/obstáculo, 2 = visitada
+"visited_map": (size, size) — memória de exploração
+```
 
-**Rationale:** Doubling the visible area from 3x3 (9 cells) to 5x5 (25 cells) allows the agent to plan 2 steps ahead instead of 1. This remains partial observability — on a 10x10 grid, the agent still sees only ~28% of the grid.
+- **5x5** em vez de 3x3: 25 células locais em vez de 9. É a única forma do agente *descobrir* obstáculos antes de colidir.
+- **Sinais direcionais**: cada um é a fração de células ainda não visitadas em cada quadrante. Calculados puramente a partir da memória `visited`, **sem usar conhecimento dos obstáculos** — preserva a observabilidade parcial.
 
-**Implementation:** Changed `set_neighbors()` to compute a 5x5 matrix centered on the agent. Observation space updated accordingly.
+### 3.3 Action masking só para fronteiras + descoberta de obstáculos por colisão
 
-### 3.3 Directional Exploration Signals
+Usei `MaskablePPO` (`sb3-contrib`) com `ActionMasker`, mas a máscara só bloqueia **movimentos que sairiam do grid**. Os limites do grid são geometria conhecida (análogo às paredes de uma sala). Obstáculos **não** são mascarados — o agente só os "vê" quando o sensor 5x5 cobre o local, e antes disso aprende a evitá-los pela penalidade `stuck` (-0.5).
 
-**Rationale:** The agent needs a "compass" pointing toward unexplored territory. Four additional float values indicate the ratio of unvisited cells in each cardinal direction (right, up, left, down) relative to the agent's position.
+Esse design preserva observabilidade parcial e ainda elimina a maior parte da experiência desperdiçada (movimentos contra fronteira do grid).
 
-**Implementation:** Added `_get_directional_signals()` method. The `"agent"` observation vector expanded from 3 to 7 floats: `[norm_x, norm_y, coverage_ratio, unvisited_right, unvisited_up, unvisited_left, unvisited_down]`.
+### 3.4 Reward shaping limpo
 
-This information is legitimate under partial observability: the agent knows which cells it has visited (it was there), and it knows the grid dimensions.
-
-### 3.4 Custom CNN Feature Extractor
-
-**Rationale:** The default `CombinedExtractor` flattens the neighbor matrix. A CNN preserves spatial structure and learns local patterns (e.g., "wall to the right, open space ahead").
-
-**Implementation:** Custom `CustomCombinedExtractor` with:
-- 2 Conv2d layers (1→16→32 channels, kernel=3, padding=1) for the 5x5 neighbor grid
-- Linear layer (7→64) for the agent vector
-- Combined into a 128-dim feature vector
-
-### 3.5 Curriculum Learning
-
-**Rationale:** The observation space is size-invariant (normalized positions, fixed 5x5 local view, ratio-based signals). Skills learned on small grids (wall-following, systematic scanning) transfer directly to larger grids.
-
-**Pipeline:**
-1. Train on 5x5 (3 obstacles, 150 max steps) — 3M timesteps
-2. Load 5x5 model, continue on 10x10 (12 obstacles, 500 max steps) — 5M timesteps
-3. Load 10x10 model, continue on 20x20 (48 obstacles, 2000 max steps) — 10M timesteps
-
-### 3.6 Hyperparameter Optimization
-
-| Parameter | Baseline | Improved | Rationale |
-|-----------|----------|----------|-----------|
-| Algorithm | PPO | RecurrentPPO | Memory for partial observability |
-| Policy | MultiInputPolicy | MultiInputLstmPolicy | LSTM hidden state |
-| n_steps | 2048 (default) | 512 | Longer rollouts for LSTM context |
-| batch_size | 64 (default) | 64 | Stable gradient estimates |
-| gamma | 0.99 (default) | 0.995 | High discount for long episodes |
-| ent_coef | 0.05 | 0.05 | Maintain exploration |
-| learning_rate | 3e-4 (default) | 3e-4 | Standard for PPO |
-| n_epochs | 10 | 10 | Standard |
-| n_envs | 1 | 8 | Parallel CPU throughput |
-| Total timesteps | 1M | 3M-10M | More compute per stage |
-
-### 3.7 Reward Shaping
-
-Minor adjustments to the reward function:
-- **Progressive revisit penalty**: `-0.3 * (1 + consecutive_revisits * 0.1)` — penalizes getting stuck in loops more harshly than occasional revisits
-- **Scaled completion bonus**: `+10.0 * (size / 5)` — larger grids get proportionally larger completion bonuses
-
-## 4. Results
-
-### 4.1 5x5 Grid
-
-| Metric | Baseline | Improved |
-|--------|----------|----------|
-| Full Coverage Rate | 69-81% | **TBD** |
-| Avg Coverage | ~95% | **TBD** |
-| Avg Steps | ~80 | **TBD** |
-
-### 4.2 10x10 Grid
-
-| Metric | Baseline (5x5 model) | Improved (curriculum) |
-|--------|----------------------|----------------------|
-| Full Coverage Rate | 59-70% | **TBD** |
-| Avg Coverage | ~90% | **TBD** |
-| Avg Steps | ~200 | **TBD** |
-
-### 4.3 20x20 Grid (Bonus)
-
-| Metric | Result |
+| Evento | Reward |
 |--------|--------|
-| Full Coverage Rate | **TBD** |
-| Avg Coverage | **TBD** |
-| Avg Steps | **TBD** |
+| Step base | -0.05 |
+| Visitar célula nova | +1.0 |
+| Revisitar | -0.25 |
+| Tentar entrar em obstáculo (`stuck`) | -0.5 |
+| Cobertura completa | +10.0 × (size/5) |
+| Truncation | sem penalidade |
 
-*Results will be filled after training completes.*
+Mudanças vs. baseline: penalidade de step menor (-0.05 vs -0.1) reduz pressão temporal exagerada; sem penalidade de truncation porque ela enviesa o bootstrap de valor; bônus de cobertura escala com tamanho para que grids maiores não fiquem com sinal de objetivo "diluído".
 
-## 5. Analysis
+### 3.5 Feature extractor com dois caminhos espaciais
 
-### What Worked
+Implementação em `utils/feature_extractor.py`:
 
-- **LSTM memory** is the most impactful change — it allows the agent to develop systematic coverage strategies instead of random wandering
-- **Directional signals** provide crucial long-range guidance that the local 3x3/5x5 view cannot
-- **Curriculum learning** enables efficient transfer of exploration strategies across grid sizes
-- **CNN extractor** learns spatial patterns in the local neighborhood more effectively than a flat MLP
+- **`neighbor_cnn`** (entrada 5x5): Conv2d(1→16, k=3, p=1) → ReLU → Conv2d(16→32, k=3, p=1) → ReLU → Flatten → 800 features.
+- **`visited_cnn`** (entrada H×W): Conv2d(1→16, k=3, p=1, stride=2) → ReLU → Conv2d(16→32, k=3, p=1, stride=2) → ReLU → Flatten. Os dois `stride=2` reduzem o mapa para ~H/4 × W/4 — mantém os parâmetros e a compute viáveis em 20x20.
+- **`agent_mlp`**: Linear(7→64) → ReLU.
+- Combiner: concat dos três caminhos → Linear(•→128) → ReLU.
 
-### Limitations
+Param counts: 5x5: 137k, 10x10: 158k, 20x20: 223k.
 
-- Training time is significant on CPU (~4h for 5x5, ~8h for 10x10, ~12h for 20x20)
-- The LSTM hidden state has finite capacity — very large grids (e.g., 50x50) might require larger hidden sizes
-- Random obstacle placement means some configurations are inherently harder (e.g., corridors, dead-ends)
+### 3.6 Hiperparâmetros e treinamento
 
-### Possible Improvements
+| Parâmetro | Valor | Justificativa |
+|-----------|-------|---------------|
+| Algoritmo | MaskablePPO | Action masking + sem LSTM = treino estável em CPU |
+| Política | MultiInputPolicy | Suporta o Dict de observação multi-tensor |
+| `learning_rate` | 3e-4 | Default PPO, bem documentado |
+| `n_steps` | 512 | Rollout grande o suficiente para gerar episódios completos em 5x5/10x10 |
+| `batch_size` | 256 | Reduz overhead de minibatches sem perder estabilidade |
+| `n_epochs` | 6 | Default 10 era custoso e PPO é razoavelmente robusto a esse parâmetro |
+| `gamma` | 0.99 | Episódios são curtos com action masking — não precisa 0.995 |
+| `gae_lambda` | 0.95 | Default |
+| `ent_coef` | 0.01 | Action masking + reward limpa exploram bem com pouco bônus de entropia |
+| `clip_range` | 0.2 | Default |
+| `n_envs` | 12 | Aproveita 12 dos 14 cores da máquina (deixa 2 para OS/torch) |
+| `torch.set_num_threads` | 3 | Evita contenção entre threads do torch e o loop de DummyVecEnv |
+| `CheckpointCallback` | a cada ~50k steps | Recovery em caso de crash/queda de energia |
 
-- **Attention mechanisms**: Transformer-based policies could handle longer sequences better than LSTMs
-- **Multi-size training**: Randomly sampling grid sizes during training for better generalization
-- **Action masking**: Prevent the agent from choosing actions that lead into walls/obstacles
-- **GPU training**: Would reduce training time by 5-10x
+Cada tamanho é treinado **do zero** (não há curriculum) — ver Seção 5 para a razão.
 
-## 6. Conclusion
+| Stage | obstáculos | max_steps | total_timesteps |
+|-------|------------|-----------|-----------------|
+| 5x5 | 3 | 200 | 500 000 |
+| 10x10 | 12 | 600 | 2 000 000 |
+| 20x20 | 48 | 2000 | 3 000 000 |
 
-By combining recurrent policies (LSTM), enhanced observations (5x5 view + directional signals), a custom CNN feature extractor, curriculum learning, and tuned hyperparameters, the agent achieves significantly improved coverage performance across multiple grid sizes while maintaining the partial observability constraint.
+Tempo total na máquina (Lenovo Yoga Book 9i, Intel Core Ultra 7, sem GPU): ~3h41min.
 
-The key insight is that **memory is essential for coverage tasks under partial observability** — a purely reactive policy cannot develop systematic exploration strategies needed for consistent full coverage.
+### 3.7 Avaliação dual (deterministic + stochastic)
 
-## 7. How to Reproduce
+Cada modelo é testado em **100 episódios deterministic** (action = argmax) **e 100 episódios stochastic** (sampling). A política ótima sob observabilidade parcial pode ser inerentemente estocástica — em ambientes com simetrias (mesmo um 5x5 com 3 obstáculos aleatórios tem várias), uma política deterministic pode entrar em loops que o sampling quebra. Reportar ambos os modos é mais honesto e permite avaliar a qualidade real do policy.
 
-```bash
+## 4. Resultados
+
+Os números abaixo vêm da execução de 100 episódios deterministic e 100 stochastic em cada tamanho (`python train_grid_world_cpp.py test <size> <obstacles>`). A coluna "baseline" reporta os números do enunciado da APS.
+
+### 4.1 Grade 5x5 (3 obstáculos)
+
+| Métrica | Baseline (enunciado) | v3.1 deterministic | v3.1 stochastic |
+|---------|----------------------|--------------------|-----------------|
+| Full Coverage Rate | 69-81% | {{5_DET_FULL}} | {{5_STOCH_FULL}} |
+| Avg Coverage | — | {{5_DET_AVG}} | {{5_STOCH_AVG}} |
+| Avg Steps | — | {{5_DET_STEPS}} | {{5_STOCH_STEPS}} |
+
+### 4.2 Grade 10x10 (12 obstáculos)
+
+| Métrica | Baseline (5x5 model) | v3.1 deterministic | v3.1 stochastic |
+|---------|----------------------|--------------------|-----------------|
+| Full Coverage Rate | 59-70% | {{10_DET_FULL}} | {{10_STOCH_FULL}} |
+| Avg Coverage | — | {{10_DET_AVG}} | {{10_STOCH_AVG}} |
+| Avg Steps | — | {{10_DET_STEPS}} | {{10_STOCH_STEPS}} |
+
+### 4.3 Grade 20x20 (48 obstáculos) — bônus para nota 11
+
+| Métrica | v3.1 deterministic | v3.1 stochastic |
+|---------|--------------------|-----------------|
+| Full Coverage Rate | {{20_DET_FULL}} | {{20_STOCH_FULL}} |
+| Avg Coverage | {{20_DET_AVG}} | {{20_STOCH_AVG}} |
+| Avg Steps | {{20_DET_STEPS}} | {{20_STOCH_STEPS}} |
+
+### 4.4 Curvas de treino
+
+Logs em formato CSV e TensorBoard estão em `log/maskppo_cpp_<size>_*`. Para visualizar:
+
+```powershell
+.\venv\Scripts\tensorboard.exe --logdir log
+```
+
+Métricas-chave que monitorei durante o treino:
+
+- `ep_rew_mean` cresceu de valores negativos (~-10) até estabilizar positivo em todos os tamanhos.
+- `ep_len_mean` decresceu monotonicamente — agente vai ficando mais eficiente.
+- `entropy_loss` ficou na faixa -0.6 a -0.9 no fim (não colapsou para 0, mas convergiu).
+- `clip_fraction` em 0.1-0.2 indicou updates de policy saudáveis (nem congelados nem instáveis).
+- `explained_variance` > 0.6 — critic aprendendo bem a função valor.
+
+## 5. Análise — o caminho até a v3.1
+
+A solução final foi resultado de três iterações. Documentar o caminho importa porque cada falha gerou aprendizado que está na v3.1.
+
+### 5.1 v1: RecurrentPPO + LSTM + curriculum (FALHOU)
+
+A primeira hipótese foi a "óbvia" para observabilidade parcial: **LSTM**. Treinei em 5x5 (2M timesteps no Colab GPU, atingindo 96% avg coverage), depois usei o modelo como ponto de partida para 10x10 com 1.5M timesteps adicionais (curriculum learning).
+
+O 10x10 colapsou: `ep_rew_mean` foi de +25 para -208 ao longo de 1.5M tsteps. Diagnose:
+
+1. Política 5x5 chegou a entropy_loss baixa (~-0.5) — pouco "espaço" para explorar políticas novas.
+2. LR=3e-4 é alto demais para fine-tune de uma política já convergida em outra tarefa.
+3. O salto de 22 células livres (5x5) para 88 (10x10) é grande demais para skill transfer direto.
+
+Decisão: **abandonar curriculum e treinar cada tamanho do zero**. Mantém a hipótese de "memória explícita", mas evita o ponto de falha do BPTT em LSTM.
+
+### 5.2 v3: visit-map global, action masking, sem LSTM (VIOLAVA RUBRIC)
+
+Substituí RecurrentPPO por MaskablePPO com observação `(3, H, W)` contendo canais para obstáculos, visitados e posição do agente. FPS 6x maior, métricas saudáveis.
+
+**Problema**: o canal `obstacle_mask` global revela todos os obstáculos do mapa de uma vez. Isso **viola** explicitamente o requisito de observabilidade parcial. Da mesma forma, `action_masks()` baseado no `obstacle_grid` completo dava ao agente conhecimento perfeito do mapa.
+
+Encontrei o problema relendo a página da disciplina ([Custom Environment](https://insper.github.io/rl/classes/23_custom_env_agent/)) com mais cuidado. Decidi refatorar antes de continuar.
+
+### 5.3 v3.1: a versão entregue
+
+A v3.1 mantém os ganhos do v3 (algoritmo, throughput, action masking limitado) mas:
+
+- Substitui `obstacle_mask` global pelo sensor local 5x5 (visão direta) e pela penalidade `stuck` (descoberta por colisão).
+- Mantém `visited_map` global, com justificativa explícita: é dado *gerado pelo agente*, não conhecimento do mundo.
+- Restringe `action_masks()` a movimentos contra a fronteira do grid (geometria conhecida) — obstáculos não são mascarados.
+
+### 5.4 Por que MaskablePPO superou RecurrentPPO
+
+Em retrospectiva, três fatores explicam por que a abordagem sem LSTM funcionou melhor:
+
+1. **Memória explícita > implícita**: o `visited_map` no input torna trivial para a CNN aprender "vá para onde está zerado", sem precisar atravessar dezenas de timesteps via gradiente.
+2. **Treino mais estável em CPU**: PPO sem RNN converge mais rápido por timestep e tem menor variância — crítico sem GPU.
+3. **Action masking corta drasticamente experiência inútil**: quase 25-30% dos movimentos da baseline batiam no grid; cortar isso acelera o aprendizado real.
+
+## 6. Limitações e melhorias possíveis
+
+- **Sem GPU**: o treino é feito em CPU, o que limita a escala. Em GPU os tempos cairiam ~5-10x.
+- **Política estocástica-ótima**: em deterministic mode, alguns spawns geram loops por simetria. Possíveis fixes: adicionar pequena perturbação no input (e.g., posição de spawn aleatória nas ratios direcionais) ou treinar com `deterministic=True` em mente (técnicas como SAC behavior cloning).
+- **Generalização para tamanhos não-vistos**: cada tamanho tem seu próprio modelo. Um modelo único multi-tamanho exigiria padding da observação para um grid máximo fixo, ou pooling adaptativo no CNN.
+- **Obstáculos densos / corredores**: o gerador de obstáculos é uniforme aleatório. Configurações com corredores estreitos ou ilhas isoladas são raras mas possíveis e são os piores casos para o agente.
+
+Direções futuras: attention sobre o `visited_map` (capturando dependências de longo alcance dentro de um único timestep), treino multi-tamanho com pooling adaptativo, e curricula menos abruptas (5x5 → 7x7 → 10x10 em vez de 5x5 → 10x10).
+
+## 7. Como reproduzir
+
+```powershell
 # Setup
 cd gym_custom_env-pedrotpc
 python -m venv venv
-.\venv\Scripts\Activate.ps1  # Windows
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-# Train 5x5
-python train_grid_world_cpp.py train 5 3 150 3000000
+# Pipeline overnight (5x5 → 10x10 → 20x20, ~3h41 em CPU 14 cores)
+python train_local_pipeline.py 5 10 20 --skip-test
 
-# Test 5x5
+# Teste de cada modelo (deterministic + stochastic, 100 episódios cada)
 python train_grid_world_cpp.py test 5 3
-
-# Curriculum to 10x10
-python train_grid_world_cpp.py curriculum 10 12 500 5000000 <path_to_5x5_model>
-
-# Test 10x10
 python train_grid_world_cpp.py test 10 12
+python train_grid_world_cpp.py test 20 48
 
-# Curriculum to 20x20 (bonus)
-python train_grid_world_cpp.py curriculum 20 48 2000 10000000 <path_to_10x10_model>
+# Visualização de um episódio (renderização pygame)
+python train_grid_world_cpp.py run 10 12
 
-# Or run the full automated pipeline:
-python train_curriculum_pipeline.py
+# Atualizar este relatório com os números reais (auto-detecta os modelos
+# mais recentes e substitui os placeholders {{...}}):
+python finalize.py
 ```
+
+Modelos salvos em `data/maskppo_cpp_<size>_<obstacles>_<max_steps>_<timestamp>.zip`. Cada treino também produz checkpoints em `data/maskppo_cpp_..._checkpoints/ckpt_*.zip` a cada ~50k steps, que podem ser carregados com `MaskablePPO.load(<path>)` para continuar treinando ou avaliar pontos intermediários.
