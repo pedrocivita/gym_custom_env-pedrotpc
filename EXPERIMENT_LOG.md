@@ -173,6 +173,55 @@ Comparado com v3.2: 5x5 caiu 3pp (94→91), 10x10 caiu **27pp** (77→50), 20x20
 
 A correlação é direta: onde o discount factor é praticamente zero, o agente otimiza só os bônus parciais e ignora a recompensa terminal. Mudar `gamma → 0.997` faz `0.997^2000 ≈ 0.0025` — pequeno mas detectável.
 
+## v3.5 (2026-05-07) — visited_map global + treino isolado
+
+**Diagnóstico do v3.4 (continue-training)**:
+
+| Grid | v3.2 stoch full | v3.4 stoch full | Avg cov stoch |
+|------|---:|---:|---:|
+| 5×5 | 94% | 96% ✅ | 99.8% |
+| 10×10 | 77% | 74% (estagnou) | 99.1% |
+| 20×20 | 1% | 10% (subiu) | 98.5% |
+
+`gamma=0.997` + `n_steps=2048` + potential shaping ajudaram só marginalmente. O padrão real é claríssimo: **avg coverage 98-99% em todos os grids, mas full coverage rate cai catastroficamente com o tamanho**. Significa que o agente cobre 98% do grid mas trava nas últimas 1-2% das células.
+
+**Causa raiz identificada**: o `visited_neighbors` 5x5 só mostra memória LOCAL; o agente sabe "quanto" e "em qual quadrante" falta cobrir (via `coverage_ratio` e directional ratios) mas **não sabe ONDE EXATAMENTE** estão as células faltando quando elas estão fora da janela 5x5. Em 20x20 com 7-8 cells faltando dispersas, ele não tem como planejar trajetória — só "tateia" o quadrante certo.
+
+**Solução**: adicionar `visited_map` GLOBAL à observação — uma matriz `(size, size)` binária mostrando exatamente quais células o agente já visitou. **NÃO viola partial observability**: o mapa é gerado pelo próprio agente durante exploração (análogo a um occupancy map SLAM construído online); nunca revela obstáculos não-explorados.
+
+**Trade-off**: shape variável (5x5 vs 10x10 vs 20x20) quebra transfer learning. Solução: treinar **cada tamanho do zero, sem curriculum**.
+
+**Observação v3.5**:
+- `agent`: 7 floats (mantido)
+- `neighbors`: 5x5 sensor (mantido)
+- `visited_neighbors`: 5x5 binário local (mantido)
+- **`visited_map`: (size, size) binário global (NOVO)** ← compensa a limitação local
+
+**Feature extractor**: 3 caminhos CNN espaciais + 1 MLP do agent:
+- `neighbor_cnn` (5x5, sem stride): 1→16→32, 800 features
+- `visited_nbr_cnn` (5x5, sem stride): 1→16→32, 800 features
+- `visited_map_cnn` (HxW, dois stride-2): 1→16→32, ~32×(H/4)×(W/4) features
+- Combiner: tudo concatenado → Linear(•→128)
+
+Param counts: 5x5: 244k / 10x10: 265k / 20x20: 330k.
+
+**Pipeline isolado** (`train_isolated_pipeline.py`):
+
+| Stage | Tsteps | ETA |
+|-------|-------:|-----|
+| 5x5 | 1.0M | ~14 min |
+| 10x10 | 3.0M | ~1h23m |
+| 20x20 | 5.0M | ~4h57m |
+| **Total** | **9M** | **~6h35m** |
+
+**Justificativa acadêmica do `visited_map` global**: a página da disciplina diz "outras informações que ele poderá coletar ao longo do processo de exploração do ambiente". O `visited_map` é exatamente isso — informação coletada por exploração. É também totalmente coerente com a literatura de SLAM em robótica (occupancy mapping). NÃO é BFS frontier nem nenhum algoritmo clássico de busca: é apenas memória estruturada do que o agente já viveu.
+
+**Resultados**: (a preencher)
+
+---
+
+## v3.4 (2026-05-07) — gamma + n_steps + potential shaping
+
 **Setup ajustado (v3.4 + continue)**: três frentes de melhoria sobre o v3.2:
 
 1. **`gamma=0.99 → 0.997`** (override em runtime via `curriculum_mode`). Faz o discount factor através do horizonte de 20x20 ir de `~1e-7` para `~2.5e-3` — pequeno mas detectável, dá gradiente para o agente fechar 100%.

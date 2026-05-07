@@ -8,18 +8,23 @@ import pygame
 # Coverage Path Planning (CPP) environment — partial-observability compliant,
 # 5x5-windowed (v3.2 / curriculum-friendly).
 #
-# Observation:
+# Observation (v3.5 — adds visited_map global to v3.2):
 #   - "agent": 7 floats — pose, coverage, 4 directional unvisited ratios
 #       computed only over what the agent already visited.
 #   - "neighbors": 5x5 sensor view centred on the agent
 #       (0 = free, 1 = obstacle/wall, 2 = visited).
 #   - "visited_neighbors": 5x5 binary memory window — 1 where the agent has
 #       already stepped (inside the same 5x5 window), 0 otherwise.
+#   - "visited_map": (size, size) binary global memory — 1 where the agent
+#       has stepped, 0 otherwise. This is data the agent generated through
+#       its own exploration trajectory (analogous to an online occupancy
+#       map a SLAM robot builds). It does NOT reveal unexplored obstacles.
 #
-# Both spatial inputs are size-invariant (always 5x5), so weights transfer
-# between grid sizes (5x5 -> 10x10 -> 20x20). This is the key change vs v3.1:
-# the previous global visited_map had shape (size, size), which broke the
-# Linear layer between sizes and prevented curriculum learning.
+# v3.5 motivation: v3.2/v3.4 stalled because the 5x5 visited window doesn't
+# tell the agent WHICH specific cells it still needs to visit when those
+# cells are far from its current position. Adding the global memory map
+# closes that gap directly. Per-size training (no curriculum) is used so
+# the variable shape of visited_map doesn't break weight transfer.
 #
 # Action masking (used by MaskablePPO) only masks moves that would leave the
 # grid. Obstacles are NOT masked: the agent must discover them through the
@@ -100,6 +105,12 @@ class GridWorldCPPEnv(gym.Env):
             "visited_neighbors": gym.spaces.Box(
                 low=np.zeros((self.WINDOW, self.WINDOW), dtype=np.float32),
                 high=np.ones((self.WINDOW, self.WINDOW), dtype=np.float32),
+                dtype=np.float32,
+            ),
+            "visited_map": gym.spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(size, size),
                 dtype=np.float32,
             ),
         })
@@ -195,6 +206,7 @@ class GridWorldCPPEnv(gym.Env):
             ], dtype=np.float32),
             "neighbors": self._neighbors.astype(np.float32),
             "visited_neighbors": self._visited_neighbors.astype(np.float32),
+            "visited_map": visited_grid.astype(np.float32),
         }
 
     def _get_info(self):
