@@ -1,10 +1,11 @@
 #
-# Coverage Path Planning trainer (v3) — MaskablePPO + visit-map observation.
+# Coverage Path Planning trainer (v3.2) — MaskablePPO + 5x5 windows.
 #
 # Usage:
 #   python train_grid_world_cpp.py train <dim> <obstacles> <max_steps> <total_timesteps>
 #   python train_grid_world_cpp.py test  <dim> <obstacles> [model_path]
 #   python train_grid_world_cpp.py run   <dim> <obstacles> [model_path]
+#   python train_grid_world_cpp.py curriculum <dim> <obstacles> <max_steps> <total_timesteps> <base_model_path>
 #
 
 import sys
@@ -172,6 +173,67 @@ def train_mode(dim, obstacles, max_steps, total_timesteps):
     return model_path
 
 
+def curriculum_mode(dim, obstacles, max_steps, total_timesteps, base_model_path,
+                    learning_rate: float = 1e-4, ent_coef: float = 0.03):
+    """Transfer learning: load `base_model_path` and continue training on a
+    new (dim, obstacles) env with reduced LR and increased entropy for
+    smoother re-adaptation. Returns the new model path."""
+    print(f"--- Curriculum: {dim}x{dim}, {obstacles} obstacles, max_steps={max_steps} ---")
+    print(f"Loading base model from {base_model_path}")
+
+    register_env()
+
+    cpu = os.cpu_count() or 4
+    n_envs = min(12, max(2, cpu - 2))
+    print(f"Using {n_envs} parallel environments (cpu_count={cpu}, torch_threads={torch.get_num_threads()})")
+
+    env_fns = [_make_env_factory(dim, obstacles, max_steps) for _ in range(n_envs)]
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    env = DummyVecEnv(env_fns)
+
+    # Load weights and bind to the new env. The observation space MUST match
+    # in shape — that's why v3.2 uses 5x5 windows for both spatial inputs.
+    model = MaskablePPO.load(base_model_path, env=env, device="cpu")
+
+    # Override lr and entropy for fine-tuning. SB3 builds lr_schedule from
+    # learning_rate at __init__, so we replace it explicitly.
+    from stable_baselines3.common.utils import constant_fn
+    model.learning_rate = learning_rate
+    model.lr_schedule = constant_fn(learning_rate)
+    model.ent_coef = ent_coef
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = f"log/maskppo_cpp_{dim}_{obstacles}_{max_steps}_{timestamp}_curr"
+    model_path = f"data/maskppo_cpp_{dim}_{obstacles}_{max_steps}_{timestamp}_curr"
+    ckpt_dir = f"{model_path}_checkpoints"
+
+    os.makedirs("log", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    new_logger = configure(log_dir, ["stdout", "csv", "tensorboard"])
+    model.set_logger(new_logger)
+
+    save_freq_per_env = max(50_000 // n_envs, 1)
+    callback = CheckpointCallback(
+        save_freq=save_freq_per_env,
+        save_path=ckpt_dir,
+        name_prefix="ckpt",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+
+    print(f"Curriculum training: {total_timesteps} steps (lr={learning_rate}, ent_coef={ent_coef})")
+    model.learn(total_timesteps=total_timesteps, callback=callback, reset_num_timesteps=False)
+    model.save(model_path)
+    print(f"Model saved to {model_path}.zip")
+    print(f"Checkpoints in {ckpt_dir}")
+    print(f"Logs saved to {log_dir}")
+
+    env.close()
+    return model_path
+
+
 def _run_test_episodes(env, model, num_episodes: int, deterministic: bool, label: str):
     full_coverage_count = 0
     total_coverages = []
@@ -275,6 +337,7 @@ def print_usage():
     print("  python train_grid_world_cpp.py train <dim> <obstacles> <max_steps> <total_timesteps>")
     print("  python train_grid_world_cpp.py test  <dim> <obstacles> [model_path]")
     print("  python train_grid_world_cpp.py run   <dim> <obstacles> [model_path]")
+    print("  python train_grid_world_cpp.py curriculum <dim> <obstacles> <max_steps> <total_timesteps> <base_model_path>")
 
 
 if __name__ == "__main__":
@@ -317,6 +380,17 @@ if __name__ == "__main__":
             print(f"No model found for {dim}x{dim} with {obstacles} obstacles. Train first.")
             sys.exit(1)
         run_mode(dim, obstacles, model_path)
+
+    elif mode == "curriculum":
+        if len(sys.argv) != 7:
+            print_usage()
+            sys.exit(1)
+        dim = int(sys.argv[2])
+        obstacles = int(sys.argv[3])
+        max_steps = int(sys.argv[4])
+        total_timesteps = int(sys.argv[5])
+        base_model_path = sys.argv[6]
+        curriculum_mode(dim, obstacles, max_steps, total_timesteps, base_model_path)
 
     else:
         print_usage()

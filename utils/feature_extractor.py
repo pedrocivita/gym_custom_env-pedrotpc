@@ -5,27 +5,29 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
 class CustomCombinedExtractor(BaseFeaturesExtractor):
-    """Feature extractor for the v3.1 partial-observability CPP observation.
+    """Feature extractor for v3.2 — two 5x5 spatial windows + agent vector.
 
     Inputs (Dict obs):
-      - "agent": (7,) — pose, coverage, 4 directional unvisited ratios.
-      - "neighbors": (5, 5) — local sensor view (single channel of int codes).
-      - "visited_map": (H, W) — agent-built memory of visited cells.
+      - "agent": (7,) — pose, coverage, 4 directional ratios.
+      - "neighbors": (5, 5) — local sensor view (free / wall / visited).
+      - "visited_neighbors": (5, 5) — binary memory of visited cells inside
+        the same 5x5 window.
 
-    The neighbor and visited_map paths each go through a small CNN; their
-    flattened features are concatenated with the agent vector and projected
-    to `features_dim`. Stride-2 in the second visited-map conv keeps params
-    manageable for 10x10 and 20x20 grids.
+    Both spatial inputs are *fixed* 5x5 regardless of grid size, so the
+    extractor parameters are identical for 5x5 / 10x10 / 20x20. This is
+    what enables transfer learning: weights from a 5x5 model load
+    directly into a 10x10 or 20x20 model.
     """
 
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 128):
         super().__init__(observation_space, features_dim)
 
         nbr_shape = observation_space["neighbors"].shape  # (5, 5)
-        vmap_shape = observation_space["visited_map"].shape  # (H, W)
+        vis_shape = observation_space["visited_neighbors"].shape  # (5, 5)
         agent_dim = observation_space["agent"].shape[0]
 
-        # 5x5 sensor view CNN — small spatial input, so no stride.
+        assert nbr_shape == vis_shape, "5x5 windows must match in shape"
+
         self.neighbor_cnn = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -33,25 +35,16 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Flatten(),
         )
-        nbr_out_dim = 32 * nbr_shape[0] * nbr_shape[1]  # 32 * 25 = 800
 
-        # Visited-map CNN — two stride-2 convs cut spatial dim by ~4x so the
-        # combiner stays light on 20x20.
         self.visited_cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Flatten(),
         )
 
-        def _ds(x: int) -> int:
-            return (x + 2 - 3) // 2 + 1
-
-        h, w = vmap_shape
-        out_h = _ds(_ds(h))
-        out_w = _ds(_ds(w))
-        vmap_out_dim = 32 * out_h * out_w
+        spatial_out = 32 * nbr_shape[0] * nbr_shape[1]  # 32 * 5 * 5 = 800
 
         self.agent_mlp = nn.Sequential(
             nn.Linear(agent_dim, 64),
@@ -59,20 +52,18 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         )
 
         self.combine = nn.Sequential(
-            nn.Linear(nbr_out_dim + vmap_out_dim + 64, features_dim),
+            nn.Linear(2 * spatial_out + 64, features_dim),
             nn.ReLU(),
         )
 
     def forward(self, observations):
-        # neighbors: (B, 5, 5) -> (B, 1, 5, 5)
         nbr = observations["neighbors"].unsqueeze(1).float()
-        # visited_map: (B, H, W) -> (B, 1, H, W)
-        vmap = observations["visited_map"].unsqueeze(1).float()
+        vis = observations["visited_neighbors"].unsqueeze(1).float()
         agent = observations["agent"].float()
 
         nbr_features = self.neighbor_cnn(nbr)
-        vmap_features = self.visited_cnn(vmap)
+        vis_features = self.visited_cnn(vis)
         agent_features = self.agent_mlp(agent)
 
-        combined = torch.cat([nbr_features, vmap_features, agent_features], dim=1)
+        combined = torch.cat([nbr_features, vis_features, agent_features], dim=1)
         return self.combine(combined)
