@@ -25,14 +25,20 @@ import pygame
 # grid. Obstacles are NOT masked: the agent must discover them through the
 # 5x5 sensor and the stuck penalty.
 #
-# Reward (v3.2):
-#   step base               -0.05
-#   new cell                +1.0
-#   revisit                 -0.25
-#   stuck (vs obstacle)     -0.5
-#   25% / 50% / 75% milestone  +2.0 each (one-time per episode)
-#   full coverage           +10 * (size / 5)
-#   truncation              0
+# Reward (v3.3):
+#   step base                       -0.05
+#   new cell                        +1.0
+#   revisit                         -0.25
+#   stuck (vs obstacle)             -0.5
+#   25% / 50% / 75% milestone       +2.0 each  (one-time per episode)
+#   90% / 95% / 98% endgame bonus   +5.0 each  (one-time per episode)
+#   full coverage                   +10 * (size / 5)
+#   truncation                      -5.0 * (1 - coverage_ratio)
+#
+# v3.3 changes (vs v3.2): the endgame bonuses give a dense gradient signal in
+# the last quarter of an episode, which is where v3.2 stalled (avg coverage
+# 97.8% on 20x20 but full coverage 1%). The proportional truncation penalty
+# pushes the agent to push past 90% even in episodes that don't fully close.
 #
 
 class GridWorldCPPEnv(gym.Env):
@@ -254,7 +260,7 @@ class GridWorldCPPEnv(gym.Env):
         is_new_cell = current_pos not in self.visited
         stayed_in_place = np.array_equal(self._agent_location, old_location)
 
-        # Reward shaping (v3.2)
+        # Reward shaping (v3.3)
         reward = -0.05
         if stayed_in_place:
             reward -= 0.5
@@ -267,11 +273,15 @@ class GridWorldCPPEnv(gym.Env):
             reward -= 0.25
             self.consecutive_revisits += 1
 
-        # Partial-coverage milestones — each awarded once per episode.
+        # Coverage milestones — each awarded once per episode.
+        # 25/50/75 give the early-game progress signal; 90/95/98 give a
+        # dense endgame signal so the agent has gradient information for
+        # the last 25% of the grid (where v3.2 stalled).
         cov = self.coverage_ratio
-        for m in (0.25, 0.50, 0.75):
+        for m, bonus in ((0.25, 2.0), (0.50, 2.0), (0.75, 2.0),
+                         (0.90, 5.0), (0.95, 5.0), (0.98, 5.0)):
             if cov >= m and m not in self._milestones_awarded:
-                reward += 2.0
+                reward += bonus
                 self._milestones_awarded.add(m)
 
         full_coverage = len(self.visited) >= self.total_free_cells
@@ -280,6 +290,11 @@ class GridWorldCPPEnv(gym.Env):
 
         if full_coverage:
             reward += 10.0 * (self.size / 5.0)
+        elif truncated:
+            # Penalty proportional to coverage shortfall: trunc at 50%
+            # coverage gives -2.5, at 95% gives -0.25. Pushes the agent
+            # toward maximising coverage even when it can't fully close.
+            reward -= 5.0 * (1.0 - self.coverage_ratio)
 
         # Refresh windows for the next observation.
         self._build_windows(self._visited_grid())
