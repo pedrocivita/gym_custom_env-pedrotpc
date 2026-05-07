@@ -1,5 +1,7 @@
 venv
 __pycache__
 log
-data
-
+# Treino completo gera ~313 MB de checkpoints intermediários — fora do git.
+# Os modelos finais (.zip ~3 MB cada) e finalize_results.json ficam versionados.
+data/*_checkpoints/
+*.stackdump

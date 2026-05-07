@@ -1,0 +1,56 @@
+{
+  "generated_at": "2026-05-05T07:00:42",
+  "results": {
+    "5": {
+      "model_path": "C:\\Users\\pedro\\Documents\\Insper\\10_Semestre\\gym_custom_env-pedrotpc\\data\\maskppo_cpp_5_3_200_20260505_002621.zip",
+      "deterministic": {
+        "full_coverage_rate": 44.0,
+        "avg_coverage": 85.8181818181818,
+        "std_coverage": 21.50610138296142,
+        "avg_steps": 67.04,
+        "std_steps": 37.230342464178335
+      },
+      "stochastic": {
+        "full_coverage_rate": 87.0,
+        "avg_coverage": 98.95454545454547,
+        "std_coverage": 3.8491707811526545,
+        "avg_steps": 39.31,
+        "std_steps": 24.74901816234333
+      }
+    },
+    "10": {
+      "model_path": "C:\\Users\\pedro\\Documents\\Insper\\10_Semestre\\gym_custom_env-pedrotpc\\data\\maskppo_cpp_10_12_600_20260505_003558.zip",
+      "deterministic": {
+        "full_coverage_rate": 0.0,
+        "avg_coverage": 48.42045454545454,
+        "std_coverage": 18.26465151144994,
+        "avg_steps": 400.0,
+        "std_steps": 0.0
+      },
+      "stochastic": {
+        "full_coverage_rate": 8.0,
+        "avg_coverage": 92.90909090909092,
+        "std_coverage": 9.690617000544375,
+        "avg_steps": 394.17,
+        "std_steps": 25.662445323857966
+      }
+    },
+    "20": {
+      "model_path": "C:\\Users\\pedro\\Documents\\Insper\\10_Semestre\\gym_custom_env-pedrotpc\\data\\maskppo_cpp_20_48_2000_20260505_011555.zip",
+      "deterministic": {
+        "full_coverage_rate": 0.0,
+        "avg_coverage": 14.164772727272727,
+        "std_coverage": 17.27571837887497,
+        "avg_steps": 1600.0,
+        "std_steps": 0.0
+      },
+      "stochastic": {
+        "full_coverage_rate": 0.0,
+        "avg_coverage": 93.07670454545455,
+        "std_coverage": 9.755919660758252,
+        "avg_steps": 1600.0,
+        "std_steps": 0.0
+      }
+    }
+  }
+}
