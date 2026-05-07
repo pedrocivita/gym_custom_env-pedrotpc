@@ -90,7 +90,7 @@ def get_policy_kwargs(features_dim=128):
     }
 
 
-def create_model(env, ent_coef=0.01, gamma: float = 0.997):
+def create_model(env, ent_coef=0.01, gamma: float = 0.997, n_steps: int = 2048):
     # Tuning aimed at CPU throughput on a 14-core box.
     # `gamma=0.997` (vs the typical 0.99) is critical for this task: the
     # full-coverage bonus only fires at episode end, and on 20x20 with
@@ -99,12 +99,18 @@ def create_model(env, ent_coef=0.01, gamma: float = 0.997):
     # detectable, so the gradient of "fully closing the grid" actually
     # reaches the policy. Empirically diagnosed after v3.2 stalled at
     # 1% full coverage on 20x20 despite avg ≈ 98%.
+    #
+    # `n_steps=2048` (vs the previous 512) ensures rollouts cover the
+    # *entire* episode in 20x20 (max_steps=2000). With n_steps=512 each
+    # rollout only captured ~25% of an episode, so PPO's GAE advantage
+    # estimation had to rely heavily on bootstrapping from value targets
+    # — fine in 5x5/10x10 but lossy at the 20x20 horizon.
     return MaskablePPO(
         "MultiInputPolicy",
         env,
         verbose=1,
         learning_rate=3e-4,
-        n_steps=512,
+        n_steps=n_steps,
         batch_size=256,
         n_epochs=6,
         gamma=gamma,
@@ -179,7 +185,7 @@ def train_mode(dim, obstacles, max_steps, total_timesteps):
 
 def curriculum_mode(dim, obstacles, max_steps, total_timesteps, base_model_path,
                     learning_rate: float = 1e-4, ent_coef: float = 0.03,
-                    gamma: float = 0.997):
+                    gamma: float = 0.997, n_steps: int = 2048):
     """Transfer learning: load `base_model_path` and continue training on a
     new (dim, obstacles) env with reduced LR and increased entropy for
     smoother re-adaptation. Optionally overrides gamma — useful when the
@@ -203,16 +209,38 @@ def curriculum_mode(dim, obstacles, max_steps, total_timesteps, base_model_path,
     # in shape — that's why v3.2 uses 5x5 windows for both spatial inputs.
     model = MaskablePPO.load(base_model_path, env=env, device="cpu")
 
-    # Override lr, entropy, and gamma for fine-tuning. SB3 builds lr_schedule
-    # from learning_rate at __init__, so we replace it explicitly. gamma is
-    # a regular attribute and just gets overwritten.
+    # Override lr, entropy, gamma, and n_steps for fine-tuning. SB3 builds
+    # lr_schedule from learning_rate at __init__, so we replace it
+    # explicitly. gamma is a regular attribute. n_steps requires recreating
+    # the rollout buffer — its size is fixed at construction.
     from stable_baselines3.common.utils import constant_fn
+    import gymnasium as _gym
+    from sb3_contrib.common.maskable.buffers import (
+        MaskableRolloutBuffer,
+        MaskableDictRolloutBuffer,
+    )
     model.learning_rate = learning_rate
     model.lr_schedule = constant_fn(learning_rate)
     model.ent_coef = ent_coef
     if gamma is not None:
         model.gamma = gamma
-    print(f"Active hyperparams: lr={learning_rate} ent_coef={ent_coef} gamma={model.gamma}")
+    if n_steps is not None and n_steps != model.n_steps:
+        model.n_steps = n_steps
+        # Pick the right buffer class based on whether the observation is a
+        # Dict (our case: agent + neighbors + visited_neighbors) or a Box.
+        is_dict_obs = isinstance(model.observation_space, _gym.spaces.Dict)
+        BufferCls = MaskableDictRolloutBuffer if is_dict_obs else MaskableRolloutBuffer
+        model.rollout_buffer = BufferCls(
+            buffer_size=n_steps,
+            observation_space=model.observation_space,
+            action_space=model.action_space,
+            device=model.device,
+            gamma=model.gamma,
+            gae_lambda=model.gae_lambda,
+            n_envs=model.n_envs,
+        )
+    print(f"Active hyperparams: lr={learning_rate} ent_coef={ent_coef} "
+          f"gamma={model.gamma} n_steps={model.n_steps}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = f"log/maskppo_cpp_{dim}_{obstacles}_{max_steps}_{timestamp}_curr"

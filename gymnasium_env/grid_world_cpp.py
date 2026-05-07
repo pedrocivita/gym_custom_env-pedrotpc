@@ -25,7 +25,7 @@ import pygame
 # grid. Obstacles are NOT masked: the agent must discover them through the
 # 5x5 sensor and the stuck penalty.
 #
-# Reward (v3.2 — reverted from v3.3 after empirical evaluation):
+# Reward (v3.4 — v3.2 base + potential-based shaping):
 #   step base               -0.05
 #   new cell                +1.0
 #   revisit                 -0.25
@@ -33,15 +33,17 @@ import pygame
 #   25% / 50% / 75% milestone  +2.0 each  (one-time per episode)
 #   full coverage           +10 * (size / 5)
 #   truncation              0
+#   potential shaping       +K * (γ * cov(s') - cov(s))   K=10, γ=0.997
 #
-# Why v3.2 reward (not v3.3): v3.3 added +5.0 endgame bonuses at 90/95/98%
-# and a proportional truncation penalty, hoping to break the "agent stalls
-# at 95% avg coverage" pattern. Empirically it backfired — stoch full
-# coverage dropped from 94/77/1% (v3.2) to 91/50/0% (v3.3). The truncation
-# penalty seems to have rewarded conservatism (agent prefers to stay in
-# safe explored regions rather than risk a low-coverage truncation), and
-# the dense endgame bonuses removed pressure to fully close. Reverting and
-# pursuing improvements via continue-training on the v3.2 weights instead.
+# v3.3 (90/95/98 + proportional trunc penalty) was tried and reverted —
+# it backfired by rewarding conservatism. v3.4 adds a *potential-based*
+# shaping term derived from Ng, Harada & Russell (1999): the term
+# γ·Φ(s') - Φ(s) is provably reward-invariant (same optimal policy as
+# the unshaped problem) but produces denser gradient signal. With Φ = 10·
+# coverage_ratio, the shaping is on the order of ~+0.03 per new-cell visit
+# in early game and ~0 in endgame; it amplifies the "make progress" signal
+# without removing pressure to fully close. Mathematically safe per Ng's
+# theorem.
 #
 
 class GridWorldCPPEnv(gym.Env):
@@ -50,6 +52,13 @@ class GridWorldCPPEnv(gym.Env):
 
     WINDOW = 5  # spatial window radius parameter (window is 2*PAD+1 = 5 wide)
     PAD = 2
+
+    # Potential-based shaping constants (Ng, Harada, Russell 1999).
+    # Φ(s) = SHAPING_K * coverage_ratio. F(s,s') = γ_shaping * Φ(s') - Φ(s).
+    # Mathematically guarantees the optimal policy is unchanged, while
+    # densifying the gradient signal toward higher coverage states.
+    SHAPING_K = 10.0
+    SHAPING_GAMMA = 0.997
 
     def __init__(self, render_mode=None, size: int = 5, obs_quantity: int = 3, max_steps: int = 200):
         self.size = size
@@ -263,7 +272,11 @@ class GridWorldCPPEnv(gym.Env):
         is_new_cell = current_pos not in self.visited
         stayed_in_place = np.array_equal(self._agent_location, old_location)
 
-        # Reward shaping (v3.2 — reverted)
+        # Capture potential before updating visited set so we can compute
+        # the potential-based shaping term F = γ·Φ(s') - Φ(s) below.
+        phi_before = self.SHAPING_K * self.coverage_ratio
+
+        # Reward shaping (v3.4)
         reward = -0.05
         if stayed_in_place:
             reward -= 0.5
@@ -289,6 +302,13 @@ class GridWorldCPPEnv(gym.Env):
 
         if full_coverage:
             reward += 10.0 * (self.size / 5.0)
+
+        # Potential-based shaping: F = γ·Φ(s') - Φ(s). With Φ = K·coverage,
+        # this is provably reward-invariant (Ng, Harada, Russell 1999) — it
+        # does not change the optimal policy, but it gives a small dense
+        # gradient signal at every step toward higher-coverage states.
+        phi_after = self.SHAPING_K * self.coverage_ratio
+        reward += self.SHAPING_GAMMA * phi_after - phi_before
 
         # Refresh windows for the next observation.
         self._build_windows(self._visited_grid())

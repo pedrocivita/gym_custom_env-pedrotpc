@@ -173,10 +173,17 @@ Comparado com v3.2: 5x5 caiu 3pp (94→91), 10x10 caiu **27pp** (77→50), 20x20
 
 A correlação é direta: onde o discount factor é praticamente zero, o agente otimiza só os bônus parciais e ignora a recompensa terminal. Mudar `gamma → 0.997` faz `0.997^2000 ≈ 0.0025` — pequeno mas detectável.
 
-**Setup ajustado**: `continue_pipeline.py` carrega os checkpoints v3.2 e continua o treino com:
+**Setup ajustado (v3.4 + continue)**: três frentes de melhoria sobre o v3.2:
+
+1. **`gamma=0.99 → 0.997`** (override em runtime via `curriculum_mode`). Faz o discount factor através do horizonte de 20x20 ir de `~1e-7` para `~2.5e-3` — pequeno mas detectável, dá gradiente para o agente fechar 100%.
+
+2. **`n_steps=512 → 2048`** (recriação do `MaskableDictRolloutBuffer`). O rollout agora cobre episódios completos no 20x20 (`max_steps=2000`), em vez de fragmentos de ~25%. PPO/GAE deixa de depender de bootstrapping pesado para estimar advantages na cauda do episódio.
+
+3. **Potential-based shaping (Ng, Harada, Russell 1999)**. O env agora adiciona, a cada step, `F = γ·Φ(s') - Φ(s)` com `Φ = 10·coverage_ratio` e `γ = 0.997`. **Provavelmente o mais importante teoricamente**: Ng et al. provam que essa forma específica de shaping é *reward-invariant* — o conjunto de políticas ótimas é exatamente o mesmo da reward original. Em prática, dá um sinal de gradiente de ~+0.4 por nova célula visitada (early game) que decai para ~0 em endgame. Diferente do v3.3 (que mudou o objetivo e causou reward hacking), este é matematicamente seguro.
+
+Outros ajustes:
 - `lr=1e-4` (vs 5e-5 anterior — 5e-5 era conservador demais para ainda mover a política)
 - `ent_coef=0.05` (combate loops em deterministic)
-- **`gamma=0.997`** (o ajuste mais importante; override aplicado após `MaskablePPO.load`)
 
 | Stage | Tsteps adicional | ETA |
 |-------|------------------:|-----|
