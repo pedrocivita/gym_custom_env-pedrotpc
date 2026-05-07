@@ -1,10 +1,15 @@
 #
-# Curriculum learning pipeline for the v3.2 CPP agent.
+# Curriculum learning pipeline for the v3.6 CPP agent.
 #
 # Trains on 5x5 from scratch, then transfers the weights to 10x10, then to
-# 20x20. The v3.2 observation uses fixed-shape 5x5 windows for both spatial
-# inputs (neighbors and visited_neighbors), so the policy + extractor have
-# identical parameter shapes across grid sizes — weights transfer directly.
+# 20x20. The v3.6 observation is minimal — agent (7,) + neighbors (5x5) —
+# so the policy + extractor have identical parameter shapes across grid
+# sizes (~110k params each); weights transfer directly between stages.
+#
+# Stage budgets follow the colleague Matheus's recipe ("treina em 5x5,
+# 10x10, e um pouco em 20x20") which reached 100% full coverage:
+# spend most compute on 5x5 and 10x10 to develop a robust coverage skill,
+# then a smaller transfer pass on 20x20.
 #
 # Usage:
 #   python train_curriculum_pipeline.py            # full 5x5 -> 10x10 -> 20x20
@@ -24,25 +29,25 @@ from train_grid_world_cpp import register_env, train_mode, curriculum_mode, test
 STAGES = [
     {
         "size": 5, "obstacles": 3, "max_steps": 200,
-        "total_timesteps": 600_000,
+        "total_timesteps": 1_000_000,
         "fps_total": 1500,
         "mode": "scratch",
     },
     {
         "size": 10, "obstacles": 12, "max_steps": 600,
-        "total_timesteps": 1_000_000,
-        "fps_total": 860,
+        "total_timesteps": 3_000_000,
+        "fps_total": 800,
         "mode": "transfer",
         "lr": 1e-4,
-        "ent_coef": 0.03,
+        "ent_coef": 0.05,
     },
     {
         "size": 20, "obstacles": 48, "max_steps": 2000,
         "total_timesteps": 1_500_000,
         "fps_total": 500,
         "mode": "transfer",
-        "lr": 1e-4,
-        "ent_coef": 0.03,
+        "lr": 5e-5,
+        "ent_coef": 0.05,
     },
 ]
 
@@ -53,7 +58,7 @@ def fmt_eta(seconds: float) -> str:
 
 def print_plan():
     print("=" * 60)
-    print("v3.2 Curriculum Pipeline (5x5 -> 10x10 -> 20x20)")
+    print("v3.6 Curriculum Pipeline (5x5 -> 10x10 -> 20x20)")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     cumulative = 0.0

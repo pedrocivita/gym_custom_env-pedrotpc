@@ -6,25 +6,26 @@ import pygame
 
 #
 # Coverage Path Planning (CPP) environment — partial-observability compliant,
-# 5x5-windowed (v3.2 / curriculum-friendly).
+# 5x5-windowed (v3.6 / minimalist observation).
 #
-# Observation (v3.5 — adds visited_map global to v3.2):
+# Observation (v3.6 — back to minimal after v3.5 over-specification failed):
 #   - "agent": 7 floats — pose, coverage, 4 directional unvisited ratios
 #       computed only over what the agent already visited.
 #   - "neighbors": 5x5 sensor view centred on the agent
 #       (0 = free, 1 = obstacle/wall, 2 = visited).
-#   - "visited_neighbors": 5x5 binary memory window — 1 where the agent has
-#       already stepped (inside the same 5x5 window), 0 otherwise.
-#   - "visited_map": (size, size) binary global memory — 1 where the agent
-#       has stepped, 0 otherwise. This is data the agent generated through
-#       its own exploration trajectory (analogous to an online occupancy
-#       map a SLAM robot builds). It does NOT reveal unexplored obstacles.
 #
-# v3.5 motivation: v3.2/v3.4 stalled because the 5x5 visited window doesn't
-# tell the agent WHICH specific cells it still needs to visit when those
-# cells are far from its current position. Adding the global memory map
-# closes that gap directly. Per-size training (no curriculum) is used so
-# the variable shape of visited_map doesn't break weight transfer.
+# v3.6 motivation: v3.5 added visited_map global as a 3rd spatial input,
+# expecting it to give the agent precise endgame info. Result was
+# catastrophic regression on 10x10 (74% -> 9% stoch full coverage) — a
+# classic critic-policy collapse. Diagnosis: the v3.x agents were
+# over-specified; the `neighbors` 5x5 already encodes visited cells (value
+# 2), so visited_neighbors was redundant and visited_map global created
+# a "shortcut" the policy became fragile around.
+#
+# This minimal observation matches the assignment text ("matrix 3x3 or 5x5
+# with the agent at the center") plus the directional ratios as "other
+# information collected through exploration" — the same approach that the
+# colleague Matheus used to reach 100% full coverage.
 #
 # Action masking (used by MaskablePPO) only masks moves that would leave the
 # grid. Obstacles are NOT masked: the agent must discover them through the
@@ -81,7 +82,6 @@ class GridWorldCPPEnv(gym.Env):
 
         self._agent_location = np.array([-1, -1], dtype=int)
         self._neighbors = np.zeros((self.WINDOW, self.WINDOW), dtype=int)
-        self._visited_neighbors = np.zeros((self.WINDOW, self.WINDOW), dtype=int)
 
         # Cached structures (NOT exposed to the agent).
         self._obstacle_set: set = set()
@@ -100,17 +100,6 @@ class GridWorldCPPEnv(gym.Env):
             "neighbors": gym.spaces.Box(
                 low=np.zeros((self.WINDOW, self.WINDOW), dtype=np.float32),
                 high=np.full((self.WINDOW, self.WINDOW), 2.0, dtype=np.float32),
-                dtype=np.float32,
-            ),
-            "visited_neighbors": gym.spaces.Box(
-                low=np.zeros((self.WINDOW, self.WINDOW), dtype=np.float32),
-                high=np.ones((self.WINDOW, self.WINDOW), dtype=np.float32),
-                dtype=np.float32,
-            ),
-            "visited_map": gym.spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(size, size),
                 dtype=np.float32,
             ),
         })
@@ -163,7 +152,10 @@ class GridWorldCPPEnv(gym.Env):
         return signals
 
     def _build_windows(self, visited_grid: np.ndarray):
-        """Compute neighbors (5x5) and visited_neighbors (5x5) via padded slicing."""
+        """Compute the 5x5 neighbors window via padded slicing.
+
+        Encoding: 0 = free / unvisited, 1 = obstacle / OOB wall, 2 = visited.
+        """
         ax, ay = self._agent_location
         pad = self.PAD
 
@@ -180,16 +172,8 @@ class GridWorldCPPEnv(gym.Env):
             not_obs = nbr_pad[vx, vy] != 1
             nbr_pad[vx[not_obs], vy[not_obs]] = 2
 
-        # visited_neighbors padded grid: 0 by default (OOB or non-visited),
-        # 1 only where the agent has visited.
-        vis_pad = np.zeros((self.size + 2 * pad, self.size + 2 * pad), dtype=int)
-        if self.visited:
-            vis_arr = np.array(list(self.visited), dtype=int)
-            vis_pad[vis_arr[:, 0] + pad, vis_arr[:, 1] + pad] = 1
-
         cx, cy = ax + pad, ay + pad
         self._neighbors = nbr_pad[cx - pad:cx + pad + 1, cy - pad:cy + pad + 1].T
-        self._visited_neighbors = vis_pad[cx - pad:cx + pad + 1, cy - pad:cy + pad + 1].T
 
     def _get_obs(self):
         visited_grid = self._visited_grid()
@@ -205,8 +189,6 @@ class GridWorldCPPEnv(gym.Env):
                 dir_signals[3],
             ], dtype=np.float32),
             "neighbors": self._neighbors.astype(np.float32),
-            "visited_neighbors": self._visited_neighbors.astype(np.float32),
-            "visited_map": visited_grid.astype(np.float32),
         }
 
     def _get_info(self):

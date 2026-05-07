@@ -4,6 +4,54 @@ Histórico cronológico das iterações de design e treino. Mantido aqui para au
 
 ---
 
+## v3.6 (2026-05-07) — Observação minimalista + curriculum estilo Matheus (atual)
+
+**Diagnóstico do v3.5 (07/05 ~21:00)**: a obs com `agent + neighbors + visited_neighbors + visited_map` era **sobre-especificada**.
+
+| Versão | 5×5 stoch | 10×10 stoch | 20×20 stoch |
+|--------|---------:|-----------:|-----------:|
+| v3.4 (curriculum + continue + gamma fix) | 96% | 74% | 10% |
+| v3.5 (visited_map global, isolated) | 96% | **9%** ⬇⬇⬇ | (interrompido) |
+
+A degradação dramática no 10×10 (74% → 9%) com sinais de treino enganosamente bons (`value_loss=1`, `explained_variance=0.999`) é assinatura clássica de **critic-policy collapse**. O `visited_map` global criou um "atalho" que comprimido por stride-2 perdia info essencial em grids médios.
+
+**Insight do colega Matheus** (que atingiu 100% full coverage):
+> "Faz ele ver 5×5 e treina em 5×5, 10×10 e um pouco em 20×20"
+
+Sugere: observação **minimalista** + curriculum pesado em 5×5 e 10×10 + transfer leve no 20×20.
+
+**Email do professor (07/05)** confirmou autorizações relevantes:
+- Estado pode ser 3×3 ou 5×5 com agente no centro.
+- Reward livre.
+- Modelos no repo (data/ fora de gitignore).
+- Curriculum OU isolado, livre escolha.
+
+**Mudanças do v3.6**:
+- **Removido** `visited_neighbors` (5,5): redundante — `neighbors` já codifica visited (valor 2).
+- **Removido** `visited_map` (size, size): causava critic-policy collapse + shape variável quebrava transfer.
+- Observação final: `agent (7,) + neighbors (5,5)` apenas.
+- Feature extractor minimalista: `neighbor_cnn` 5×5 + `agent_mlp` 7→64 + combiner. **~110k params em todos os tamanhos** (transfer 100% compatível).
+- **Mantido** o que comprovadamente funciona:
+  - `gamma=0.997` (crítico pro horizon do 20×20)
+  - `n_steps=2048` (rollouts cobrem episódios completos)
+  - Reward com bônus parciais 25/50/75% + potential-based shaping (Ng et al. 1999)
+  - `MaskablePPO` com action masking só out-of-bounds
+
+**Pipeline curriculum** (`train_curriculum_pipeline.py`):
+
+| Stage | Modo | Tsteps | lr | ent_coef | ETA |
+|-------|------|-------:|---:|---------:|-----|
+| 5×5 | scratch | 1.0M | 3e-4 | 0.01 | ~14 min |
+| 10×10 | transfer | 3.0M | 1e-4 | 0.05 | ~50 min (sem visited_map é mais leve) |
+| 20×20 | transfer | 1.5M | 5e-5 | 0.05 | ~50 min |
+| **Total** | | **5.5M** | | | **~1h55m** |
+
+**Justificativa do "lr menor no 20×20"**: alinha com a dica "um pouco em 20×20" — o transfer leve preserva a skill aprendida no 10×10, em vez de re-aprender do zero numa observação parcialmente nova.
+
+**Resultados**: (a preencher após pipeline rodar)
+
+---
+
 ## v1 (2026-05-04) — RecurrentPPO + LSTM + curriculum (FALHOU)
 
 **Hipótese**: a baseline (PPO + 3x3 view, 1M tsteps) falha por falta de memória. Solução clássica: substituir por RecurrentPPO com LSTM, e usar curriculum learning 5x5 → 10x10 conforme sugerido no enunciado.
