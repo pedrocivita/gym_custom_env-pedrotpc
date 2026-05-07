@@ -29,15 +29,20 @@ STAGES = [
         "size": 10, "obstacles": 12, "max_steps": 600,
         "total_timesteps": 1_500_000,
         "fps_total": 700,
-        "lr": 5e-5,        # halve the curriculum lr — fine-tune mode
-        "ent_coef": 0.05,  # bump entropy to break out of any deterministic loops
+        "lr": 1e-4,       # match curriculum lr (5e-5 was too conservative)
+        "ent_coef": 0.05, # bump entropy to break out of any deterministic loops
+        "gamma": 0.997,   # lift discount so the long-horizon full-coverage
+                          # bonus stays visible (0.99^600 ≈ 2e-3 was too small)
     },
     {
         "size": 20, "obstacles": 48, "max_steps": 2000,
-        "total_timesteps": 3_000_000,
+        "total_timesteps": 4_000_000,  # +1M vs original; gamma helps but
+                                       # 20x20 is the hardest stage
         "fps_total": 400,
-        "lr": 5e-5,
+        "lr": 1e-4,
         "ent_coef": 0.05,
+        "gamma": 0.997,   # critical at this scale: 0.99^2000 ≈ 0 made the
+                          # full-coverage bonus invisible to the policy
     },
 ]
 
@@ -60,7 +65,7 @@ def print_plan():
             f"  {s['size']:>2}x{s['size']:<2} | obs={s['obstacles']:<3} "
             f"max_steps={s['max_steps']:<5} "
             f"timesteps={s['total_timesteps']:>10,} "
-            f"lr={s['lr']} ent={s['ent_coef']} "
+            f"lr={s['lr']} ent={s['ent_coef']} gamma={s.get('gamma', 0.997)} "
             f"~ETA={fmt_eta(eta)}"
         )
         print(f"          base = {latest if latest else '(NONE FOUND)'}")
@@ -104,6 +109,7 @@ def main():
                 base_model_path=base_path,
                 learning_rate=stage["lr"],
                 ent_coef=stage["ent_coef"],
+                gamma=stage.get("gamma", 0.997),
             )
         except Exception as e:
             print(f"!!! Continue stage {s}x{s} failed: {e}")

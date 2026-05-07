@@ -90,11 +90,15 @@ def get_policy_kwargs(features_dim=128):
     }
 
 
-def create_model(env, ent_coef=0.01):
-    # Tuning aimed at CPU throughput on a 14-core box:
-    #   - larger n_steps (rollout) so updates are less frequent
-    #   - larger batch_size to cut minibatch overhead
-    #   - fewer epochs (6 instead of 10) to keep per-rollout wall-time down
+def create_model(env, ent_coef=0.01, gamma: float = 0.997):
+    # Tuning aimed at CPU throughput on a 14-core box.
+    # `gamma=0.997` (vs the typical 0.99) is critical for this task: the
+    # full-coverage bonus only fires at episode end, and on 20x20 with
+    # max_steps=2000 the discount factor 0.99^2000 ≈ 0 makes that signal
+    # invisible to the agent. With 0.997, 0.997^2000 ≈ 0.0025 — small but
+    # detectable, so the gradient of "fully closing the grid" actually
+    # reaches the policy. Empirically diagnosed after v3.2 stalled at
+    # 1% full coverage on 20x20 despite avg ≈ 98%.
     return MaskablePPO(
         "MultiInputPolicy",
         env,
@@ -103,7 +107,7 @@ def create_model(env, ent_coef=0.01):
         n_steps=512,
         batch_size=256,
         n_epochs=6,
-        gamma=0.99,
+        gamma=gamma,
         gae_lambda=0.95,
         ent_coef=ent_coef,
         clip_range=0.2,
@@ -174,10 +178,14 @@ def train_mode(dim, obstacles, max_steps, total_timesteps):
 
 
 def curriculum_mode(dim, obstacles, max_steps, total_timesteps, base_model_path,
-                    learning_rate: float = 1e-4, ent_coef: float = 0.03):
+                    learning_rate: float = 1e-4, ent_coef: float = 0.03,
+                    gamma: float = 0.997):
     """Transfer learning: load `base_model_path` and continue training on a
     new (dim, obstacles) env with reduced LR and increased entropy for
-    smoother re-adaptation. Returns the new model path."""
+    smoother re-adaptation. Optionally overrides gamma — useful when the
+    base model was trained with gamma=0.99 (which is too low for 20x20's
+    long horizon) and you want to switch to 0.997 for the continuation.
+    Returns the new model path."""
     print(f"--- Curriculum: {dim}x{dim}, {obstacles} obstacles, max_steps={max_steps} ---")
     print(f"Loading base model from {base_model_path}")
 
@@ -195,12 +203,16 @@ def curriculum_mode(dim, obstacles, max_steps, total_timesteps, base_model_path,
     # in shape — that's why v3.2 uses 5x5 windows for both spatial inputs.
     model = MaskablePPO.load(base_model_path, env=env, device="cpu")
 
-    # Override lr and entropy for fine-tuning. SB3 builds lr_schedule from
-    # learning_rate at __init__, so we replace it explicitly.
+    # Override lr, entropy, and gamma for fine-tuning. SB3 builds lr_schedule
+    # from learning_rate at __init__, so we replace it explicitly. gamma is
+    # a regular attribute and just gets overwritten.
     from stable_baselines3.common.utils import constant_fn
     model.learning_rate = learning_rate
     model.lr_schedule = constant_fn(learning_rate)
     model.ent_coef = ent_coef
+    if gamma is not None:
+        model.gamma = gamma
+    print(f"Active hyperparams: lr={learning_rate} ent_coef={ent_coef} gamma={model.gamma}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = f"log/maskppo_cpp_{dim}_{obstacles}_{max_steps}_{timestamp}_curr"

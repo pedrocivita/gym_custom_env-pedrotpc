@@ -161,16 +161,29 @@ Comparado com v3.2: 5x5 caiu 3pp (94→91), 10x10 caiu **27pp** (77→50), 20x20
 
 ---
 
-## Continue-training v3.2 (2026-05-07) — em curso / a executar
+## Continue-training v3.2 com gamma corrigido (2026-05-07)
 
-**Objetivo**: levar 10x10 stoch full de 77% → ≥90%, e tentar mover 20x20 de 1% → algo defensável.
+**Diagnóstico crítico antes de rodar**: revisão da configuração revelou que `gamma=0.99` provavelmente é a causa raiz do problema do 20x20 não fechar. O bônus de full coverage (+10×size/5) só é dado no fim do episódio. Com `gamma=0.99` e `max_steps=2000` no 20x20, o discount factor `0.99^2000 ≈ 0` faz esse sinal **invisível** para a política — o agente literalmente não enxerga o bônus de "fechar 100%" através de 2000 timesteps de discount. Isso é consistente com os resultados observados:
 
-**Setup**: `continue_pipeline.py` carrega os checkpoints v3.2 (`maskppo_cpp_*_curr.zip`) e continua o treino com lr=5e-5 (metade do curriculum lr) e ent_coef=0.05 (ligeiramente maior, para combater os loops em deterministic mode).
+| Grid | max_steps | `0.99^max_steps` | Observado v3.2 stoch full |
+|------|----------:|-----------------:|--------------------------:|
+| 5x5 | 200 | 0.13 | 94% ✅ |
+| 10x10 | 600 | 0.0024 | 77% (borderline) |
+| 20x20 | 1500-2000 | ~1e-7 | 1% ❌ |
+
+A correlação é direta: onde o discount factor é praticamente zero, o agente otimiza só os bônus parciais e ignora a recompensa terminal. Mudar `gamma → 0.997` faz `0.997^2000 ≈ 0.0025` — pequeno mas detectável.
+
+**Setup ajustado**: `continue_pipeline.py` carrega os checkpoints v3.2 e continua o treino com:
+- `lr=1e-4` (vs 5e-5 anterior — 5e-5 era conservador demais para ainda mover a política)
+- `ent_coef=0.05` (combate loops em deterministic)
+- **`gamma=0.997`** (o ajuste mais importante; override aplicado após `MaskablePPO.load`)
 
 | Stage | Tsteps adicional | ETA |
 |-------|------------------:|-----|
 | 10x10 | +1.5M | ~36 min |
-| 20x20 | +3.0M | ~2h05m |
+| 20x20 | +4.0M (era 3M; +1M extra) | ~2h47m |
+
+Total: ~3h22m.
 
 **Resultados**: (a preencher)
 
