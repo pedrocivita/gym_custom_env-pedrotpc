@@ -130,7 +130,49 @@ Plano de 10M timesteps total (2M+5M+3M) overnight no Colab T4. Estimado 6-7h. Ca
 
 **Pipeline**: `train_curriculum_pipeline.py` re-executado com novo reward, mesmos hyperparams.
 
-**Resultados**: (a preencher após o pipeline rodar)
+**Wall-time**: 1h14m48s (mais rápido que v3.2 1h48m — episódios completam mais cedo, aumentando throughput médio).
+
+**Métricas finais de treino (sinais ENGANOSAMENTE bons)**:
+- 5x5 final: `explained_variance≈0.85, entropy_loss≈-1.0`
+- 10x10 final: `explained_variance=0.86, entropy_loss=-1.02, value_loss=15.8` (melhor que v3.2!)
+- 20x20 final: `explained_variance=0.99, entropy_loss=-1.01, value_loss=2.0` (critic praticamente perfeito)
+
+**Resultados de avaliação (PIORARAM vs v3.2)**:
+
+| Grid | Det Full | Stoch Full | Stoch Avg |
+|------|---------:|-----------:|----------:|
+| 5x5 | 34.0% | 91.0% ✅ | 99.3% |
+| 10x10 | 0.0% | **50.0%** ⬇ | 98.7% |
+| 20x20 | 0.0% | **0.0%** ⬇ | 94.7% |
+
+Comparado com v3.2: 5x5 caiu 3pp (94→91), 10x10 caiu **27pp** (77→50), 20x20 caiu 1pp (1→0). 5x5 ainda passa o critério de 90% mas margem encolheu.
+
+**Diagnóstico do retrocesso** — três hipóteses convergentes:
+
+1. **Truncation penalty proporcional rewardou conservadorismo**: o agente passou a evitar exploração arriscada (que poderia falhar em fechar coverage) em favor de manter-se em regiões já exploradas. Episódio truncado com 95% custa só -0.25, mas com 50% custa -2.5; o agente aprende a NUNCA ir abaixo de 90% mesmo que isso o impeça de "investir" em fechar 100%.
+
+2. **Bônus 90/95/98% removeram pressão pra fechar**: com +15.0 disponíveis nesses três milestones (mais barato do que tentar full coverage), o policy aprendeu "atinge milestones, não tenta fechar". É a clássica falha do reward shaping: a agente otimiza o reward, não o objetivo verdadeiro.
+
+3. **Sinais de treino enganaram**: `value_loss=2.0` no fim parecia excelente, mas refletia que o critic estava modelando bem um POLICY MAIS CONSERVADOR (que tem returns mais previsíveis pq foge de risco). Critic confiante + policy ruim = underdiagnosis.
+
+**Decisão**: reverter o env para reward v3.2, apagar os modelos v3.3, e perseguir melhorias via **continue-training nos checkpoints v3.2** (que tinham 5x5=94%, 10x10=77%, 20x20=1%).
+
+**Lição RL**: reward shaping é uma faca de dois gumes. Bônus densos podem ajudar exploração mas também distorcer o objetivo. A regra geral de Ng et al. (1999) sobre potential-based shaping NÃO foi seguida aqui (os bônus de v3.3 não são funções potenciais), o que abre espaço para "reward hacking" — exatamente o que aconteceu.
+
+---
+
+## Continue-training v3.2 (2026-05-07) — em curso / a executar
+
+**Objetivo**: levar 10x10 stoch full de 77% → ≥90%, e tentar mover 20x20 de 1% → algo defensável.
+
+**Setup**: `continue_pipeline.py` carrega os checkpoints v3.2 (`maskppo_cpp_*_curr.zip`) e continua o treino com lr=5e-5 (metade do curriculum lr) e ent_coef=0.05 (ligeiramente maior, para combater os loops em deterministic mode).
+
+| Stage | Tsteps adicional | ETA |
+|-------|------------------:|-----|
+| 10x10 | +1.5M | ~36 min |
+| 20x20 | +3.0M | ~2h05m |
+
+**Resultados**: (a preencher)
 
 ---
 
