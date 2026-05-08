@@ -2,53 +2,15 @@
 
 Histórico cronológico das iterações de design e treino. Mantido aqui para auditabilidade da entrega.
 
----
+## TL;DR — Resultado final (v3.7)
 
-## v3.6 (2026-05-07) — Observação minimalista + curriculum estilo Matheus (atual)
+| Grid | Stoch Full | Stoch Avg | Det Full | Det Avg |
+|------|-----------:|----------:|---------:|--------:|
+| 5×5 | **100.0%** | 100.0% | 97.0% | 98.5% |
+| 10×10 | **97.0%** | 99.7% | 68.0% | 90.2% |
+| 20×20 (bônus) | **97.0%** | 99.0% | 6.0% | 67.5% |
 
-**Diagnóstico do v3.5 (07/05 ~21:00)**: a obs com `agent + neighbors + visited_neighbors + visited_map` era **sobre-especificada**.
-
-| Versão | 5×5 stoch | 10×10 stoch | 20×20 stoch |
-|--------|---------:|-----------:|-----------:|
-| v3.4 (curriculum + continue + gamma fix) | 96% | 74% | 10% |
-| v3.5 (visited_map global, isolated) | 96% | **9%** ⬇⬇⬇ | (interrompido) |
-
-A degradação dramática no 10×10 (74% → 9%) com sinais de treino enganosamente bons (`value_loss=1`, `explained_variance=0.999`) é assinatura clássica de **critic-policy collapse**. O `visited_map` global criou um "atalho" que comprimido por stride-2 perdia info essencial em grids médios.
-
-**Insight do colega Matheus** (que atingiu 100% full coverage):
-> "Faz ele ver 5×5 e treina em 5×5, 10×10 e um pouco em 20×20"
-
-Sugere: observação **minimalista** + curriculum pesado em 5×5 e 10×10 + transfer leve no 20×20.
-
-**Email do professor (07/05)** confirmou autorizações relevantes:
-- Estado pode ser 3×3 ou 5×5 com agente no centro.
-- Reward livre.
-- Modelos no repo (data/ fora de gitignore).
-- Curriculum OU isolado, livre escolha.
-
-**Mudanças do v3.6**:
-- **Removido** `visited_neighbors` (5,5): redundante — `neighbors` já codifica visited (valor 2).
-- **Removido** `visited_map` (size, size): causava critic-policy collapse + shape variável quebrava transfer.
-- Observação final: `agent (7,) + neighbors (5,5)` apenas.
-- Feature extractor minimalista: `neighbor_cnn` 5×5 + `agent_mlp` 7→64 + combiner. **~110k params em todos os tamanhos** (transfer 100% compatível).
-- **Mantido** o que comprovadamente funciona:
-  - `gamma=0.997` (crítico pro horizon do 20×20)
-  - `n_steps=2048` (rollouts cobrem episódios completos)
-  - Reward com bônus parciais 25/50/75% + potential-based shaping (Ng et al. 1999)
-  - `MaskablePPO` com action masking só out-of-bounds
-
-**Pipeline curriculum** (`train_curriculum_pipeline.py`):
-
-| Stage | Modo | Tsteps | lr | ent_coef | ETA |
-|-------|------|-------:|---:|---------:|-----|
-| 5×5 | scratch | 1.0M | 3e-4 | 0.01 | ~14 min |
-| 10×10 | transfer | 3.0M | 1e-4 | 0.05 | ~50 min (sem visited_map é mais leve) |
-| 20×20 | transfer | 1.5M | 5e-5 | 0.05 | ~50 min |
-| **Total** | | **5.5M** | | | **~1h55m** |
-
-**Justificativa do "lr menor no 20×20"**: alinha com a dica "um pouco em 20×20" — o transfer leve preserva a skill aprendida no 10×10, em vez de re-aprender do zero numa observação parcialmente nova.
-
-**Resultados**: (a preencher após pipeline rodar)
+Pipeline 5×5 → 10×10 → 20×20 treina em **1h06m** em CPU 14 cores. As iterações abaixo estão em ordem cronológica de implementação (v1 → v3.7); a versão final é a v3.7 ao fim deste documento.
 
 ---
 
@@ -220,53 +182,6 @@ Comparado com v3.2: 5x5 caiu 3pp (94→91), 10x10 caiu **27pp** (77→50), 20x20
 | 20x20 | 1500-2000 | ~1e-7 | 1% ❌ |
 
 A correlação é direta: onde o discount factor é praticamente zero, o agente otimiza só os bônus parciais e ignora a recompensa terminal. Mudar `gamma → 0.997` faz `0.997^2000 ≈ 0.0025` — pequeno mas detectável.
-
-## v3.5 (2026-05-07) — visited_map global + treino isolado
-
-**Diagnóstico do v3.4 (continue-training)**:
-
-| Grid | v3.2 stoch full | v3.4 stoch full | Avg cov stoch |
-|------|---:|---:|---:|
-| 5×5 | 94% | 96% ✅ | 99.8% |
-| 10×10 | 77% | 74% (estagnou) | 99.1% |
-| 20×20 | 1% | 10% (subiu) | 98.5% |
-
-`gamma=0.997` + `n_steps=2048` + potential shaping ajudaram só marginalmente. O padrão real é claríssimo: **avg coverage 98-99% em todos os grids, mas full coverage rate cai catastroficamente com o tamanho**. Significa que o agente cobre 98% do grid mas trava nas últimas 1-2% das células.
-
-**Causa raiz identificada**: o `visited_neighbors` 5x5 só mostra memória LOCAL; o agente sabe "quanto" e "em qual quadrante" falta cobrir (via `coverage_ratio` e directional ratios) mas **não sabe ONDE EXATAMENTE** estão as células faltando quando elas estão fora da janela 5x5. Em 20x20 com 7-8 cells faltando dispersas, ele não tem como planejar trajetória — só "tateia" o quadrante certo.
-
-**Solução**: adicionar `visited_map` GLOBAL à observação — uma matriz `(size, size)` binária mostrando exatamente quais células o agente já visitou. **NÃO viola partial observability**: o mapa é gerado pelo próprio agente durante exploração (análogo a um occupancy map SLAM construído online); nunca revela obstáculos não-explorados.
-
-**Trade-off**: shape variável (5x5 vs 10x10 vs 20x20) quebra transfer learning. Solução: treinar **cada tamanho do zero, sem curriculum**.
-
-**Observação v3.5**:
-- `agent`: 7 floats (mantido)
-- `neighbors`: 5x5 sensor (mantido)
-- `visited_neighbors`: 5x5 binário local (mantido)
-- **`visited_map`: (size, size) binário global (NOVO)** ← compensa a limitação local
-
-**Feature extractor**: 3 caminhos CNN espaciais + 1 MLP do agent:
-- `neighbor_cnn` (5x5, sem stride): 1→16→32, 800 features
-- `visited_nbr_cnn` (5x5, sem stride): 1→16→32, 800 features
-- `visited_map_cnn` (HxW, dois stride-2): 1→16→32, ~32×(H/4)×(W/4) features
-- Combiner: tudo concatenado → Linear(•→128)
-
-Param counts: 5x5: 244k / 10x10: 265k / 20x20: 330k.
-
-**Pipeline isolado** (`train_isolated_pipeline.py`):
-
-| Stage | Tsteps | ETA |
-|-------|-------:|-----|
-| 5x5 | 1.0M | ~14 min |
-| 10x10 | 3.0M | ~1h23m |
-| 20x20 | 5.0M | ~4h57m |
-| **Total** | **9M** | **~6h35m** |
-
-**Justificativa acadêmica do `visited_map` global**: a página da disciplina diz "outras informações que ele poderá coletar ao longo do processo de exploração do ambiente". O `visited_map` é exatamente isso — informação coletada por exploração. É também totalmente coerente com a literatura de SLAM em robótica (occupancy mapping). NÃO é BFS frontier nem nenhum algoritmo clássico de busca: é apenas memória estruturada do que o agente já viveu.
-
-**Resultados**: (a preencher)
-
----
 
 ## v3.4 (2026-05-07) — gamma + n_steps + potential shaping
 

@@ -13,14 +13,16 @@ Baseline (PPO + MultiInputPolicy, 1M timesteps, ent_coef=0.05): ~69-81% full cov
 
 ## 2. Diagnóstico das limitações da baseline
 
+A baseline aqui é o setup PPO + MultiInputPolicy descrito no enunciado (sem as alterações da v3.7). Identifiquei seis limitações distintas, ordenadas por impacto observado:
+
 | Limitação | Efeito |
 |-----------|--------|
 | Sem memória explícita ou feature de progresso espacial | Agente "esquece" onde já passou; cai em loops em grids maiores |
 | `gamma=0.99` com `max_steps=2000` | `0.99^2000 ≈ 1e-7` — bônus de cobertura completa é invisível ao agente no 20x20 |
 | `n_steps=512` em episódios de 2000 steps | PPO/GAE fragmenta rollouts em 25% do episódio; advantage estimation lossy |
-| Sem action masking | Desperdiça experiência batendo em paredes (que são geometria conhecida) |
-| Layouts impossíveis na geração | ~30% dos layouts 10x10 e ~80% dos 20x20 enclausuram células — ceiling natural < 100% |
-| Sinal direcional fraco no endgame | Razões direcionais decaem para 1/N com 1 célula faltando — agente não sabe pra onde ir |
+| PPO padrão (sem action masking de bordas) | Desperdiça experiência batendo em paredes do grid (geometria conhecida que poderia ser mascarada sem violar partial obs) |
+| Layouts gerados sem garantia de solvability | ~30% dos layouts 10x10 e ~80% dos 20x20 enclausuram células — ceiling natural < 100% mesmo com política ótima |
+| Sinal direcional fraco no endgame | Razões direcionais decaem para 1/N com 1 célula faltando — agente não tem informação suficiente para escolher direção |
 
 ## 3. Estratégia adotada (v3.7)
 
@@ -57,7 +59,7 @@ Em `reset()`, regenera obstáculos até obter layout onde todas as células livr
 | Stuck (obstáculo) | -0.5 | Aprender a evitar obstáculos descobertos |
 | 25% / 50% / 75% milestone | +2.0 cada | Sinal de progresso intermediário |
 | Cobertura completa | +10 × (size/5) | Escala com dificuldade (10/20/40 em 5/10/20) |
-| Potential-based shaping | `+10·(γ·cov(s') - cov(s))` | Ng, Harada & Russell (1999): provavelmente reward-invariant; densifica gradiente |
+| Potential-based shaping | `+10·(γ·cov(s') - cov(s))` | Ng, Harada & Russell (1999) provam que essa forma específica é *reward-invariant* (mesma política ótima da reward original); densifica o gradiente sem alterar o objetivo |
 
 ### 3.5 Feature extractor (`utils/feature_extractor.py`)
 
@@ -135,9 +137,17 @@ Curvas de treino (TensorBoard em `log/`):
 
 ### 5.2 O insight final (v3.7)
 
-Conversa no WhatsApp da turma com o colega Rodrigo Medeiros (que tirou sucesso): "Ignorar layouts inalcançáveis e adicionar mais informação pro agente — distância pra fronteira". E Pedro Civita confirmou em aula com o professor que o filtro de solvability é permitido na geração do ambiente.
+A direção da v3.7 veio de duas fontes complementares:
 
-Diagnóstico final do v3.6: o agente conseguia avg 99.3% no 10x10 mas full=67% porque (1) ~30% dos layouts eram impossíveis de fechar e (2) com 1 célula faltando, ratio direcional ≈ 1/50 = 2% — sinal fraco demais pra política comprometer. **Polish bateu no teto** porque atacava decisão (entropy), não informação.
+1. **Discussão com colega de turma (Rodrigo Medeiros, via WhatsApp do grupo da disciplina, 08/05):** "Ignorar layouts inalcançáveis e adicionar mais informação pro agente — distância pra fronteira. Não é DFS, eu só passei mais informação pro agente mesmo." A receita combina exatamente as duas peças que a v3.6 tinha individualmente isoladas mas nunca juntas.
+
+2. **Confirmação direta com o professor (em aula, 08/05):** perguntei se filtrar layouts impossíveis na geração do ambiente (`reset()`) era permitido. Ele confirmou que sim, desde que documentado e que o filtro vivesse na fase de geração — não no policy. Isso autorizou a Mudança B abaixo.
+
+Diagnóstico final da v3.6: o agente conseguia avg 99.3% no 10x10 mas full=67% por dois motivos somados:
+- ~30% dos layouts eram objetivamente impossíveis de fechar (células enclausuradas), o que cria um teto duro independente da política;
+- nos layouts solvíveis, com 1 célula faltando, o ratio direcional decaía para ≈ 1/50 = 2% — sinal insuficiente para a política comprometer com uma direção específica.
+
+**Polish (3 tentativas com `ent_coef` decrescente) bateu no teto** porque atacava o sintoma (política não-decisiva) e não a causa (falta de informação no estado).
 
 v3.7 ataca a causa real:
 1. **Compass `(dx, dy, dist)`**: vetor unitário pra célula não-visitada mais próxima (excluindo obstáculos conhecidos). Quando sobra 1 célula 8 longe: compass = (0.8, 0, 0.4) — sinal **40× mais forte** que o ratio.
@@ -174,7 +184,29 @@ A drop em entropy_loss é a smoking gun: com compass + solvability filter, a aç
 | Hierarchical RL / MAML / Rainbow DQN | Custo/risco proibitivo perto do deadline |
 | Imitation learning + BFS teacher | Borderline com restrição "não usar BFS no policy"; v3.7 mostra que não é necessário |
 
-## 7. Como reproduzir
+## 7. Conformidade com as restrições do enunciado
+
+| Restrição | Como a v3.7 cumpre |
+|-----------|---------------------|
+| **Observabilidade parcial** — agente não pode ter mapa completo do ambiente | (a) sensor 5x5 é a única forma de descobrir obstáculos; (b) `_known_obstacles` rastreia *só* obstáculos vistos pelo sensor; (c) compass `(dx, dy, dist)` e razões direcionais são derivados *exclusivamente* do `visited_set` do agente e dos `_known_obstacles` — nenhuma feature consulta o mapa global de obstáculos; (d) action mask só bloqueia movimentos para fora do grid (geometria conhecida do enunciado, análoga a paredes de uma sala) |
+| **Estado: 3x3 ou 5x5 com agente no centro** | Sensor `neighbors` é exatamente 5x5 com agente no centro. As 10 features do `agent` vec são "outras informações coletadas durante exploração" (autorizadas pelo professor em e-mail de 07/05) |
+| **Sem BFS/DFS/algoritmos clássicos no policy** | A política RL nunca chama BFS. O *único* uso de BFS no projeto é dentro de `_is_layout_solvable()`, executado em `reset()` para verificar se o ambiente gerado é viável — não influencia decisões da política. O compass usa `argmin` de Manhattan (O(N²), sem busca), também aprovado pelo professor como feature engineering |
+| **Treino: isolado OU transfer learning** (autorização 07/05) | Uso curriculum com transfer learning 5x5 → 10x10 → 20x20. Mesma observação shape em todos os tamanhos torna o transfer 100% compatível |
+| **Modelos salvos no repositório** (autorização 07/05) | `data/` versionada no git; 3 modelos finais v3.7 estão commitados no `main` do repositório |
+
+## 8. Referências bibliográficas
+
+- **Ng, A. Y., Harada, D., & Russell, S. (1999).** *Policy invariance under reward transformations: Theory and application to reward shaping.* In Proceedings of the Sixteenth International Conference on Machine Learning (ICML), pp. 278–287. — Base teórica do potential-based shaping usado em §3.4. Prova que `F(s, s') = γ·Φ(s') - Φ(s)` preserva o conjunto de políticas ótimas.
+
+- **Schulman, J., Wolski, F., Dhariwal, P., Radford, A., & Klimov, O. (2017).** *Proximal Policy Optimization Algorithms.* arXiv:1707.06347. — Algoritmo base do MaskablePPO usado.
+
+- **Sutton, R. S., & Barto, A. G. (2018).** *Reinforcement Learning: An Introduction* (2nd ed.). MIT Press. — Base teórica geral (curriculum learning, transfer learning, valor-função, GAE).
+
+- **Stable-Baselines3** ([DLR-RM/stable-baselines3](https://github.com/DLR-RM/stable-baselines3)) e **sb3-contrib** ([Stable-Baselines-Team/stable-baselines3-contrib](https://github.com/Stable-Baselines-Team/stable-baselines3-contrib)): implementação do `MaskablePPO`, `MaskableDictRolloutBuffer` e `ActionMasker` usados.
+
+- **Discussão com a turma (08/05/2026, WhatsApp grupo RL Insper):** colega Rodrigo Medeiros sugeriu a combinação "filtro de solvability + feature de distância à fronteira". Colega Matheus mencionou em conversa anterior (07/05) que o caminho era "minimalismo na observação + curriculum forte". Ambas contribuíram para o desenho da v3.7.
+
+## 9. Como reproduzir
 
 ```powershell
 # Setup
