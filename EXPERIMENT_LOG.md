@@ -289,7 +289,112 @@ Outros ajustes:
 
 Total: ~3h22m.
 
-**Resultados**: (a preencher)
+**Resultados**: 5x5: 96% / 10x10: 74% / 20x20: 10% stoch full coverage. Avanço significativo no 20x20 (de 1% para 10%), mas ainda longe do alvo de 90%.
+
+---
+
+## v3.5 (2026-05-07) — visited_map global → critic-policy collapse
+
+Adicionei `visited_map` (size, size) global como 3º input espacial à observação, esperando que daria ao agente info precisa pra fechar 100% no endgame. Treino isolado por size (sem curriculum, pois shape variável quebra transfer).
+
+**Sinais de treino enganosos**: `value_loss=1`, `explained_variance=0.999` — *parecia* perfeito.
+
+**Resultados**: 5x5: 96% / 10x10: **9%** / 20x20: incompleto. **REGRESSÃO CATASTRÓFICA**. O critic decorou um atalho que o policy não conseguiu explorar. Lesson: explained_variance alto NÃO garante boa policy.
+
+Diagnóstico: o `visited_map` global criou um shortcut que, depois de comprimido pelo CNN com strides, perdia a info espacial fina necessária no 10x10. v3.5 abandonado.
+
+---
+
+## v3.6 (2026-05-07) — back to minimalist (Matheus's recipe)
+
+WhatsApp do colega Matheus (que tirou 100%): "Faz ele ver 5x5 e treina em 5x5, 10x10 e um pouco em 20x20". Pivot pra observação minimalista.
+
+**Mudanças vs v3.5:**
+- Removido `visited_map` global e `visited_neighbors` da obs.
+- Obs final: `agent (7) + neighbors (5,5)`. Param count: 110k uniforme em todos os tamanhos (transfer 100% compatível).
+- Curriculum: 5x5 scratch (1M) → 10x10 transfer (3M, lr=1e-4, ent=0.05) → 20x20 transfer (1.5M, lr=5e-5, ent=0.05).
+
+**Resultados (após pipeline + 2 polish rounds reduzindo ent para 0.005):**
+- 5x5 stoch: 92% full
+- 10x10 stoch: **67%** full (avg 99.3%, std 1.3%, range [94.3%, 100%])
+- 20x20 stoch: **0%** full (avg 97.1%)
+
+**Diagnóstico do teto 67% no 10x10:**
+1. Em endgame (1-3 células faltando), `_get_directional_signals()` decai para `1/N` ≈ 1-2% — sinal fraco demais pra política comprometer com uma direção.
+2. Polish (3 tentativas com ent_coef de 0.01 → 0.005 → 0.002) bateu no teto. Não era problema de decisão, era falta de informação.
+
+---
+
+## v3.7 (2026-05-08) — compass + solvability filter (FINAL)
+
+Combinação de 2 mudanças baseada em conversa com colegas no WhatsApp turma RL:
+
+**Insight do Rodrigo Medeiros (que tirou sucesso):**
+> "Ignorar os layouts inalcançáveis e adicionar mais informação pro agente (por onde ele já passou e frontier). Não é DFS. Mano eu só passei mais informação pro agente mesmo. Um histórico daonde ele já passou, a distância pra fronteira."
+
+**Aprovação do professor (08/05, em aula, confirmação Pedro Civita):**
+> "Falei pro prof hj e ele perguntou se eu estava fazendo no reset(), falei q sim e ele aceitou. Eh so deixar documentado. Mas eh na geração do ensaio, no reset()."
+
+### Mudança A: nearest-unvisited compass (resolve gap de info no endgame)
+
+Adicionado ao `agent` vec (7 → 10 floats): `(dx, dy, dist)` para a célula não-visitada mais próxima que NÃO seja obstáculo conhecido.
+
+- `_known_obstacles: set` rastreia obstáculos vistos pelo sensor 5x5 (preserva observabilidade parcial — só conta o que o agente já observou).
+- `_get_nearest_unvisited()` faz argmin Manhattan O(N²). Não é busca de planejamento, é feature engineering.
+- Quando sobra 1 célula 8 longe, ratio direcional = 1/50 ≈ 2%. Compass: dx=0.8, dy=0, dist=0.4. **Sinal 40× mais forte.**
+
+### Mudança B: solvability filter no reset()
+
+Em `reset()`, regenera obstáculos até obter layout onde TODAS células livres são alcançáveis (BFS reachability check). Cap de 200 retries.
+
+- ~25-35% dos layouts 10x10 com 12 obstáculos têm pockets cercadas.
+- ~80% dos layouts 20x20 com 48 obstáculos.
+- Sem filtro: full_coverage=0% nessas episódios independente da política.
+
+Custo: 0.24ms (5x5) / 0.52ms (10x10) / 2.62ms (20x20) por reset. Negligível.
+
+### Mudança C: ent_coef=0.01 desde 10x10
+
+v3.6 usava 0.05 no curriculum 10x10/20x20 pra "amaciar transfer". Resultado: política travou em alta entropia. v3.7 usa 0.01 desde o começo do 10x10 — política comprime decisivamente.
+
+### Pipeline e tempo
+
+| Stage | Tsteps | LR | ent_coef | ETA |
+|-------|--------|------|----------|-----|
+| 5x5 scratch | 1.0M | 3e-4 | 0.01 | ~10 min |
+| 10x10 transfer | 3.0M | 1e-4 | 0.01 | ~30 min |
+| 20x20 transfer | 1.5M | 5e-5 | 0.01 | ~22 min |
+
+**Wall-time total: 1h06m** (1694 fps no 5x5, 1694 fps no 10x10, 1178 fps no 20x20).
+
+### Sinais de treino (saudáveis)
+
+| Métrica | 5x5 final | 10x10 final | 20x20 final |
+|---------|-----------|-------------|-------------|
+| `entropy_loss` | -0.143 | ~-0.4 | -0.443 |
+| `explained_variance` | 0.985 | ~0.97 | 0.99 |
+| `value_loss` | 0.92 | ~7 | 23.3 |
+| `clip_fraction` | 0.08 | ~0.08 | 0.05 |
+
+Comparação: v3.6 5x5 final entropy era -0.75. v3.7: -0.143 → política **5× mais decisiva** porque o compass torna a ação ótima óbvia em todo estado.
+
+### Resultados FINAIS (avaliação 100 episódios det + 100 episódios stoch)
+
+| Stage | Det Full | Det Avg | **Stoch Full** | Stoch Avg | Stoch Steps |
+|-------|---------:|--------:|---------------:|----------:|------------:|
+| **5x5**   | 97% | 98.5% | **100.0%** ✅ | 100.0% | 24/100 |
+| **10x10** | 68% | 90.2% | **97.0%** ✅ | 99.7% | 117/400 |
+| **20x20** | 6%  | 67.5% | **97.0%** ✅ | 99.0% | 581/1600 |
+
+- **Nota 10 garantida**: 5x5 e 10x10 ≥ 90% stoch full coverage. ✅✅
+- **Nota 11 (bônus)**: 20x20 também ≥ 90% stoch full coverage. ✅
+
+### Lições
+
+1. **Identificar gargalo certo importa mais que mais compute.** 3 polishes em v3.6 não furaram o teto porque atacavam decisão (entropy) e não informação (obs). v3.7 mudou a obs, resolveu em 1h.
+2. **Feature engineering sobre conhecimento do agente é OK.** Compass é derivado do `visited_set` + `known_obstacles` — info que o agente já tem, só apresentada de forma mais útil. Não viola observabilidade parcial.
+3. **Filtros na geração do ambiente são OK** (com aprovação documentada). v3.7 só elimina episódios objetivamente impossíveis da distribuição — não muda info do agente.
+4. **explained_variance alto + entropy baixa** ≠ collapse, desde que value_loss não seja artificialmente baixo (v3.5 tinha 1.0; v3.7 tem 0.92→23 conforme grid cresce, sinal de critic real). Isso aqui é **policy convergence saudável**, não collapse.
 
 ---
 

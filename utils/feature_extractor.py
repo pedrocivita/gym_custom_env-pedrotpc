@@ -5,23 +5,26 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
 class CustomCombinedExtractor(BaseFeaturesExtractor):
-    """Feature extractor for v3.6 — minimalist (just neighbors 5x5 + agent vec).
+    """Feature extractor for v3.7 — minimalist (neighbors 5x5 + agent vec).
 
     Inputs (Dict obs):
-      - "agent": (7,) — pose, coverage, 4 directional unvisited ratios.
+      - "agent": (10,) — pose (2), coverage (1), 4 directional unvisited
+                  ratios (4), nearest-unvisited compass (dx, dy, dist) (3).
       - "neighbors": (5, 5) — local sensor view (free=0 / wall=1 / visited=2).
 
-    Both inputs are size-invariant (always the same shape regardless of
-    grid size), so weights transfer between 5x5 / 10x10 / 20x20 cleanly.
-    Param count is identical across sizes (~110k), enabling curriculum
-    learning without buffer mismatches.
+    Both inputs are size-invariant (same shape across grid sizes), so
+    weights transfer between 5x5 / 10x10 / 20x20 cleanly. Param count
+    is identical across sizes, enabling curriculum learning without
+    buffer mismatches.
 
-    v3.6 reverts the over-specification of v3.5 (which added visited_map
-    global as a 3rd spatial input and caused critic-policy collapse on
-    10x10). The `neighbors` 5x5 already encodes visited cells (value 2),
-    so a separate visited_neighbors channel was redundant. The directional
-    ratios in the agent vector still give global "where to go" signal
-    derived purely from the agent's own visited set.
+    The `agent_dim` is read dynamically from `observation_space["agent"]`,
+    so this extractor works for any agent vector size — v3.6 (7) or
+    v3.7 (10). The new (dx, dy, dist) compass to the nearest unvisited
+    cell that the agent has not seen as an obstacle gives a strong
+    endgame signal: the directional ratios degrade to ~1/N when only one
+    cell remains, which is too weak to commit to a direction. The
+    compass instead points at the actual remaining cell with a unit-scale
+    vector, fixing the late-game stall pattern observed in v3.6.
     """
 
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 128):

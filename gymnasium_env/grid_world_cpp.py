@@ -6,26 +6,44 @@ import pygame
 
 #
 # Coverage Path Planning (CPP) environment — partial-observability compliant,
-# 5x5-windowed (v3.6 / minimalist observation).
+# 5x5-windowed (v3.7 / minimalist + nearest-unvisited compass).
 #
-# Observation (v3.6 — back to minimal after v3.5 over-specification failed):
-#   - "agent": 7 floats — pose, coverage, 4 directional unvisited ratios
-#       computed only over what the agent already visited.
+# Observation (v3.7):
+#   - "agent": 10 floats
+#       [0,1]  pose_x, pose_y       (normalized [0,1])
+#       [2]    coverage_ratio       (visited / total_free, [0,1])
+#       [3-6]  4 directional unvisited ratios (right/up/left/down, [0,1])
+#       [7,8]  signed (dx, dy) toward nearest UNVISITED cell that the
+#              agent does NOT already know is an obstacle. Normalized
+#              by (size-1) so values are in [-1, 1].
+#       [9]    Manhattan distance to that nearest cell, normalized by
+#              2*(size-1), in [0, 1].
 #   - "neighbors": 5x5 sensor view centred on the agent
 #       (0 = free, 1 = obstacle/wall, 2 = visited).
 #
-# v3.6 motivation: v3.5 added visited_map global as a 3rd spatial input,
-# expecting it to give the agent precise endgame info. Result was
-# catastrophic regression on 10x10 (74% -> 9% stoch full coverage) — a
-# classic critic-policy collapse. Diagnosis: the v3.x agents were
-# over-specified; the `neighbors` 5x5 already encodes visited cells (value
-# 2), so visited_neighbors was redundant and visited_map global created
-# a "shortcut" the policy became fragile around.
+# v3.7 motivation: v3.6 (7-feature agent vec) reached 67% stoch full
+# coverage on 10x10 and 0% on 20x20 because the directional ratios
+# decay to ~1/N when only one cell is left, providing essentially no
+# signal for endgame closure. The new (dx, dy, dist) compass to the
+# nearest cell the agent has NOT visited and NOT seen-as-obstacle gives
+# a strong, distance-weighted vector that points the agent at unfinished
+# work — exactly the missing signal. It is computed only from the
+# agent's own visited set and the obstacles it has revealed via the 5x5
+# sensor, so partial observability is preserved (no global obstacle map
+# leakage like v3.5's visited_map). This is feature engineering, not
+# planning — argmin over Manhattan distance, no graph search.
 #
-# This minimal observation matches the assignment text ("matrix 3x3 or 5x5
-# with the agent at the center") plus the directional ratios as "other
-# information collected through exploration" — the same approach that the
-# colleague Matheus used to reach 100% full coverage.
+# v3.7 also adds a solvability filter at reset(): obstacle layouts that
+# enclose any free cell (making full_coverage objectively unreachable)
+# are regenerated until a solvable layout is produced. This was approved
+# by the professor (08/05/2026) provided it lives at the generation step
+# and is documented. Without it, ~25-35% of 10x10 layouts had unreachable
+# pockets that capped success rate regardless of policy quality.
+#
+# This still matches the assignment text ("matrix 3x3 or 5x5 with the
+# agent at the center") — the central observation is the 5x5 sensor.
+# The agent vector contains derived quantities from "other information
+# collected during exploration" (visited set + sensor-revealed obstacles).
 #
 # Action masking (used by MaskablePPO) only masks moves that would leave the
 # grid. Obstacles are NOT masked: the agent must discover them through the
@@ -83,6 +101,12 @@ class GridWorldCPPEnv(gym.Env):
         self._agent_location = np.array([-1, -1], dtype=int)
         self._neighbors = np.zeros((self.WINDOW, self.WINDOW), dtype=int)
 
+        # Cells the agent has *seen* through its 5x5 sensor and confirmed are
+        # obstacles. Kept so the nearest-unvisited compass can skip them; the
+        # agent should not be told about obstacles it has not yet observed
+        # (partial observability), but cells it has seen are fair game.
+        self._known_obstacles: set = set()
+
         # Cached structures (NOT exposed to the agent).
         self._obstacle_set: set = set()
         self._obstacle_grid: np.ndarray = np.zeros((size, size), dtype=bool)
@@ -91,10 +115,24 @@ class GridWorldCPPEnv(gym.Env):
         _r = np.arange(size)
         self._xs, self._ys = np.meshgrid(_r, _r, indexing='ij')
 
+        # Agent vec layout:
+        #   pose_x, pose_y        -> [0, 1]
+        #   coverage              -> [0, 1]
+        #   4 directional ratios  -> [0, 1]
+        #   dx, dy compass        -> [-1, 1]
+        #   dist compass          -> [0, 1]
+        agent_low = np.array(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, 0.0],
+            dtype=np.float32,
+        )
+        agent_high = np.array(
+            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  1.0,  1.0, 1.0],
+            dtype=np.float32,
+        )
         self.observation_space = gym.spaces.Dict({
             "agent": gym.spaces.Box(
-                low=np.zeros(7, dtype=np.float32),
-                high=np.ones(7, dtype=np.float32),
+                low=agent_low,
+                high=agent_high,
                 dtype=np.float32,
             ),
             "neighbors": gym.spaces.Box(
@@ -155,6 +193,8 @@ class GridWorldCPPEnv(gym.Env):
         """Compute the 5x5 neighbors window via padded slicing.
 
         Encoding: 0 = free / unvisited, 1 = obstacle / OOB wall, 2 = visited.
+        Also expands `self._known_obstacles` with any obstacle cells revealed
+        inside the current sensor window (partial-observability respected).
         """
         ax, ay = self._agent_location
         pad = self.PAD
@@ -175,9 +215,47 @@ class GridWorldCPPEnv(gym.Env):
         cx, cy = ax + pad, ay + pad
         self._neighbors = nbr_pad[cx - pad:cx + pad + 1, cy - pad:cy + pad + 1].T
 
+        # Expand known_obstacles with any obstacle cells inside the 5x5
+        # sensor window (in world coordinates). Iterating self._obstacle_set
+        # is O(K) where K = obstacle count (3-48), much cheaper than scanning
+        # the 25-cell window each step.
+        x_lo, x_hi = ax - pad, ax + pad
+        y_lo, y_hi = ay - pad, ay + pad
+        for (ox, oy) in self._obstacle_set:
+            if x_lo <= ox <= x_hi and y_lo <= oy <= y_hi:
+                self._known_obstacles.add((ox, oy))
+
+    def _get_nearest_unvisited(self, visited_grid: np.ndarray):
+        """Return (dx, dy, dist) toward the nearest cell the agent has
+        neither visited nor confirmed is an obstacle. Computed only from
+        agent-known information so partial observability is preserved.
+
+        Output ranges: dx, dy in [-1, 1]; dist in [0, 1].
+        Returns (0, 0, 0) when nothing remains (full coverage / endgame).
+        """
+        ax, ay = self._agent_location
+        candidate = ~visited_grid
+        if self._known_obstacles:
+            ko_arr = np.array(list(self._known_obstacles), dtype=int)
+            candidate[ko_arr[:, 0], ko_arr[:, 1]] = False
+        if not candidate.any():
+            return 0.0, 0.0, 0.0
+        dist = np.abs(self._xs - ax) + np.abs(self._ys - ay)
+        # Use a large sentinel for ineligible cells so argmin lands on a
+        # candidate. 9999 is > any possible Manhattan distance up to 20x20.
+        dist_inf = np.where(candidate, dist, 9999)
+        flat_idx = int(np.argmin(dist_inf))
+        nx, ny = np.unravel_index(flat_idx, dist_inf.shape)
+        norm = max(self.size - 1, 1)
+        dx = float((int(nx) - ax) / norm)
+        dy = float((int(ny) - ay) / norm)
+        d = float((abs(int(nx) - ax) + abs(int(ny) - ay)) / (2 * norm))
+        return dx, dy, d
+
     def _get_obs(self):
         visited_grid = self._visited_grid()
         dir_signals = self._get_directional_signals(visited_grid)
+        ndx, ndy, ndd = self._get_nearest_unvisited(visited_grid)
         return {
             "agent": np.array([
                 self._agent_location[0] / max(self.size - 1, 1),
@@ -187,6 +265,9 @@ class GridWorldCPPEnv(gym.Env):
                 dir_signals[1],
                 dir_signals[2],
                 dir_signals[3],
+                ndx,
+                ndy,
+                ndd,
             ], dtype=np.float32),
             "neighbors": self._neighbors.astype(np.float32),
         }
@@ -219,25 +300,64 @@ class GridWorldCPPEnv(gym.Env):
             obs_arr = np.array(list(self._obstacle_set), dtype=int)
             self._obstacle_grid[obs_arr[:, 0], obs_arr[:, 1]] = True
 
+    def _is_layout_solvable(self) -> bool:
+        """BFS reachability check from the agent's starting cell. Returns
+        True iff every free (non-obstacle) cell is reachable, i.e. there
+        are no enclosed pockets that would make full_coverage objectively
+        unreachable regardless of policy quality.
+
+        Used ONLY at reset/generation time, never for policy decisions.
+        Professor approved this filter on 08/05/2026 (in-class) provided
+        it is documented and lives at the environment-generation step.
+        """
+        from collections import deque
+        start = tuple(int(c) for c in self._agent_location)
+        seen = {start}
+        queue = deque([start])
+        while queue:
+            x, y = queue.popleft()
+            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + ddx, y + ddy
+                if (0 <= nx < self.size and 0 <= ny < self.size
+                        and (nx, ny) not in self._obstacle_set
+                        and (nx, ny) not in seen):
+                    seen.add((nx, ny))
+                    queue.append((nx, ny))
+        return len(seen) == self.total_free_cells
+
+    # Cap on retries to avoid pathological infinite loops in degenerate
+    # configurations (very rare; typical 10x10/12-obstacle expects 1-3 retries).
+    MAX_LAYOUT_RETRIES = 200
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         self.count_steps = 0
-        self.obstacles_locations = []
         self.visited = set()
         self.consecutive_revisits = 0
         self._milestones_awarded = set()
+        self._known_obstacles = set()
 
         self._agent_location = self.np_random.integers(0, self.size, size=2, dtype=int)
 
-        _tmp_obs_set: set = {tuple(self._agent_location)}
-        for _ in range(self.obs_quantity):
-            obstacle_location = self._agent_location.copy()
-            while tuple(obstacle_location) in _tmp_obs_set:
-                obstacle_location = self.np_random.integers(0, self.size, size=2, dtype=int)
-            self.obstacles_locations.append(obstacle_location)
-            _tmp_obs_set.add(tuple(obstacle_location))
+        # Generate obstacles repeatedly until the layout is solvable
+        # (every free cell reachable from agent start). Without this filter
+        # ~25-35% of 10x10 layouts (and most 20x20) randomly enclose a cell,
+        # capping full_coverage at <100% no matter what policy is learned.
+        for _retry in range(self.MAX_LAYOUT_RETRIES):
+            self.obstacles_locations = []
+            _tmp_obs_set: set = {tuple(self._agent_location)}
+            for _ in range(self.obs_quantity):
+                obstacle_location = self._agent_location.copy()
+                while tuple(obstacle_location) in _tmp_obs_set:
+                    obstacle_location = self.np_random.integers(0, self.size, size=2, dtype=int)
+                self.obstacles_locations.append(obstacle_location)
+                _tmp_obs_set.add(tuple(obstacle_location))
+            self._rebuild_obstacle_caches()
+            if self._is_layout_solvable():
+                break
+        # If we exhausted MAX_LAYOUT_RETRIES we fall through with the last
+        # generated layout — vanishingly unlikely with 12-48 obstacles.
 
-        self._rebuild_obstacle_caches()
         self.visited.add(tuple(self._agent_location))
         self._build_windows(self._visited_grid())
 

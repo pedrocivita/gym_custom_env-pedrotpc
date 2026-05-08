@@ -7,38 +7,47 @@
 
 ## 1. Problema
 
-Treinar um agente RL para **cobrir todas as células livres** em grids 5x5, 10x10 e (bônus) 20x20, sob **observabilidade parcial** — o agente não pode receber o mapa completo do ambiente. A baseline (PPO + MultiInputPolicy, 1M timesteps) atinge ~75-81% full-coverage em 5x5 e ~59-70% em 10x10.
+Treinar um agente RL para **cobrir todas as células livres** em grids 5x5, 10x10 e (bônus) 20x20, sob **observabilidade parcial** — o agente não pode receber o mapa completo do ambiente. Tem acesso a um sensor local 5x5 ao seu redor + informações que ele mesmo derivou da exploração (visited set, obstáculos descobertos pelo sensor).
 
-## 2. Diagnóstico da baseline
+Baseline (PPO + MultiInputPolicy, 1M timesteps, ent_coef=0.05): ~69-81% full coverage em 5x5 e ~59-70% em 10x10. Falha em 20x20.
+
+## 2. Diagnóstico das limitações da baseline
 
 | Limitação | Efeito |
 |-----------|--------|
-| MLP feedforward sem memória | Cai em loops em grids maiores |
-| Visão 3x3 (9 células) | Em 10x10 enxerga ~10% do grid |
-| Sem direção do não-explorado | Só sabe *quanto* falta cobrir, não *para onde ir* |
-| Sem action masking | Desperdiça experiência batendo em paredes |
+| Sem memória explícita ou feature de progresso espacial | Agente "esquece" onde já passou; cai em loops em grids maiores |
+| `gamma=0.99` com `max_steps=2000` | `0.99^2000 ≈ 1e-7` — bônus de cobertura completa é invisível ao agente no 20x20 |
+| `n_steps=512` em episódios de 2000 steps | PPO/GAE fragmenta rollouts em 25% do episódio; advantage estimation lossy |
+| Sem action masking | Desperdiça experiência batendo em paredes (que são geometria conhecida) |
+| Layouts impossíveis na geração | ~30% dos layouts 10x10 e ~80% dos 20x20 enclausuram células — ceiling natural < 100% |
+| Sinal direcional fraco no endgame | Razões direcionais decaem para 1/N com 1 célula faltando — agente não sabe pra onde ir |
 
-## 3. Estratégia adotada
+## 3. Estratégia adotada (v3.7)
 
-### 3.1 Algoritmo: MaskablePPO + memória explícita (sem LSTM)
+### 3.1 Algoritmo: MaskablePPO
 
-Substituí RecurrentPPO+LSTM (memória implícita via BPTT, frágil em CPU) por **memória explícita** na observação: um mapa binário do que o agente já visitou. A CNN aprende trivialmente "vá para onde está zerado", sem precisar gradiente atravessar dezenas de timesteps.
+`sb3-contrib.MaskablePPO` com `MultiInputPolicy`. Action masking só de movimentos para fora do grid (geometria conhecida, análoga a paredes de uma sala). **Obstáculos não são mascarados** — o agente os descobre via sensor 5x5 ou pela penalidade `stuck` ao colidir, preservando observabilidade parcial.
 
 ### 3.2 Observação (partial observability preservada)
 
 ```python
-"agent":       (7,)         # pose, coverage, 4 razões direcionais de não-visitado
-"neighbors":   (5, 5)       # sensor local — única forma de descobrir obstáculos
-"visited_map": (size, size) # memória binária de exploração do agente
+"agent": (10,)  # pose (2), coverage (1), 4 razões direcionais (4),
+                # nearest-unvisited compass dx, dy, dist (3)
+"neighbors": (5, 5)  # sensor local — única forma de descobrir obstáculos
+                     # (0=free, 1=obstáculo/wall, 2=visited)
 ```
 
-**Não viola partial observability**: o `visited_map` é dado *gerado pelo agente ao se mover* (análogo a um occupancy map SLAM construído online) e nunca revela células não-exploradas. As razões direcionais usam só o `visited_map`, não o ground-truth.
+**Compass nearest-unvisited (`dx, dy, dist`):** vetor para a célula não-visitada mais próxima que NÃO seja obstáculo conhecido (revelado pelo sensor). Computado por argmin Manhattan O(N²) sobre o `visited_set` do agente excluindo `_known_obstacles`. **Não é busca de planejamento** — é feature engineering sobre informação que o agente já possui, apresentada de forma mais útil (sinal forte vs ratio direcional fraco no endgame).
 
-### 3.3 Action masking restrito
+**Não viola observabilidade parcial:** todas as features são derivadas da exploração do próprio agente (visited set + sensor history). Nenhuma exposição do mapa global de obstáculos.
 
-`MaskablePPO` mascara **apenas movimentos para fora do grid** (geometria conhecida — análogo a paredes de uma sala). **Obstáculos não são mascarados**: o agente os descobre via sensor 5x5 ou pela penalidade `stuck` (-0.5) ao colidir. Assim a observabilidade parcial é preservada mas a maior parte da experiência desperdiçada some.
+### 3.3 Filtro de solvability na geração do ambiente
 
-### 3.4 Reward shaping
+Em `reset()`, regenera obstáculos até obter layout onde todas as células livres são alcançáveis a partir da posição inicial do agente (BFS reachability check, capped em 200 retries). Sem o filtro, o agente é punido por episódios objetivamente impossíveis de fechar.
+
+**Aprovação do professor (08/05/2026, em aula):** o filtro é permitido desde que viva na geração do ambiente (`reset()`) e seja documentado. Ele NÃO dá nova informação ao agente — apenas remove episódios fora da distribuição válida.
+
+### 3.4 Reward (potential-based shaping)
 
 | Evento | Reward | Justificativa |
 |--------|--------|---------------|
@@ -46,97 +55,156 @@ Substituí RecurrentPPO+LSTM (memória implícita via BPTT, frágil em CPU) por 
 | Célula nova | +1.0 | Sinal principal |
 | Revisita | -0.25 | Desencorajar loops |
 | Stuck (obstáculo) | -0.5 | Aprender a evitar obstáculos descobertos |
-| Cobertura completa | +10 × (size/5) | Escala com dificuldade |
-| Truncation | 0 | Evita viés no bootstrap de valor |
+| 25% / 50% / 75% milestone | +2.0 cada | Sinal de progresso intermediário |
+| Cobertura completa | +10 × (size/5) | Escala com dificuldade (10/20/40 em 5/10/20) |
+| Potential-based shaping | `+10·(γ·cov(s') - cov(s))` | Ng, Harada & Russell (1999): provavelmente reward-invariant; densifica gradiente |
 
 ### 3.5 Feature extractor (`utils/feature_extractor.py`)
 
-Dois caminhos CNN + um MLP, concatenados em um vetor de 128 dimensões:
-- `neighbor_cnn`: Conv(1→16, k=3) → Conv(16→32, k=3) → 800 features.
-- `visited_cnn`: Conv(1→16, k=3, **stride=2**) → Conv(16→32, k=3, **stride=2**) — `stride=2` mantém o 20x20 viável em CPU.
-- `agent_mlp`: Linear(7→64).
-- Combiner: Linear(•→128).
+```python
+neighbor_cnn: Conv(1→16, k=3) → Conv(16→32, k=3) → Flatten  # 800 features
+agent_mlp:    Linear(10→64) → ReLU                          # 64 features
+combine:      Linear(864 → 128) → ReLU                      # 128 features
+```
 
-Param counts: 5x5: 137k, 10x10: 158k, 20x20: 223k.
+**Param count: 116k uniforme em 5x5, 10x10 e 20x20.** Como ambos inputs são size-invariant (5x5 sensor + 10-feature agent vec), pesos transferem 100% entre tamanhos sem buffer mismatch — viabiliza curriculum learning sem retraining de camada.
 
-### 3.6 Hiperparâmetros e treinamento
+### 3.6 Curriculum learning (5x5 → 10x10 → 20x20)
 
-| Param | Valor |
-|-------|-------|
-| `learning_rate` / `clip_range` / `gamma` / `gae_lambda` | 3e-4 / 0.2 / 0.99 / 0.95 |
-| `n_steps` / `batch_size` / `n_epochs` | 512 / 256 / 6 |
-| `ent_coef` | 0.01 |
-| `n_envs` | 12 (DummyVecEnv) |
-| `torch.set_num_threads` | 3 (evita contenção com vec-env loop) |
-| Checkpoints | a cada ~50k env-steps (recovery em caso de crash) |
+| Stage | Modo | Tsteps | LR | ent_coef | Tempo |
+|-------|------|--------|------|----------|-------|
+| 5x5   | scratch | 1.0M | 3e-4 | 0.01 | ~10 min |
+| 10x10 | transfer | 3.0M | 1e-4 | 0.01 | ~30 min |
+| 20x20 | transfer | 1.5M | 5e-5 | 0.01 | ~22 min |
 
-| Stage | Obstáculos | max_steps | Timesteps | Tempo CPU |
-|-------|------------|-----------|-----------|-----------|
-| 5x5 | 3 | 200 | 500k | ~9 min |
-| 10x10 | 12 | 600 | 2.0M | ~50 min |
-| 20x20 | 48 | 2000 | 3.0M | ~1h13min |
+**Total wall-time: 1h06m** em CPU (Lenovo Yoga Book 9i, Intel Core Ultra 7, 14 cores, sem GPU).
 
-Pipeline total: **2h03min** em Lenovo Yoga Book 9i (Intel Core Ultra 7, 14 cores, sem GPU).
+Hyperparams chave: `gamma=0.997` (vs default 0.99 — torna full coverage bonus visível em 20x20), `n_steps=2048` (vs default 512 — rollouts cobrem episódio inteiro), `gae_lambda=0.95`, `clip_range=0.2`, `batch_size=256`, `n_epochs=6`, `n_envs=12` (DummyVecEnv), `torch.set_num_threads=3`.
 
 ### 3.7 Avaliação dual (deterministic + stochastic)
 
-Cada modelo é avaliado em 100 episódios deterministic (`argmax`) e 100 stochastic (`sample`). Sob observabilidade parcial a política ótima pode ser estocástica — em ambientes com simetrias do `visited_map`, sampling quebra loops que `argmax` não quebra. Reportar ambos é mais honesto.
+Cada modelo é avaliado em 100 episódios deterministic (`argmax`) e 100 stochastic (`sample`). Sob observabilidade parcial a política ótima pode ser estocástica — sampling quebra simetrias do estado conhecido que `argmax` perpetua em loops. Reportar ambos é mais honesto.
 
 ## 4. Resultados
 
-100 episódios deterministic + 100 stochastic em cada grid. A APS pede **"cobertura próxima de 100%"** — a métrica que reflete diretamente esse critério é o **Avg Coverage** (fração média do grid coberto por episódio); o **Full Coverage Rate** é uma métrica binária mais estrita (atingiu exatamente 100% ou não). Reportamos as duas para transparência. Sob observabilidade parcial a política ótima é estocástica (ver §3.7), então a coluna **Stochastic** é a leitura primária do desempenho.
+100 episódios deterministic + 100 stochastic em cada grid. `max_steps` no teste = `dim²×4` (4.5x mais que o número de células livres — teto generoso pra agente bem-formado).
 
 ### 4.1 Grid 5x5 (3 obstáculos)
 
-| Métrica | Baseline | Deterministic | Stochastic |
-|---------|----------|---------------|------------|
-| Full Coverage Rate | 69-81% | **44.0%** | **87.0%** |
-| Avg Coverage | — | 85.8% | **99.0%** |
-| Avg Steps | — | 67 | 39 |
+| Métrica | Baseline | Deterministic | **Stochastic** |
+|---------|----------|---------------|----------------|
+| Full Coverage Rate | 69-81% | **97.0%** | **100.0%** ✅ |
+| Avg Coverage | — | 98.5% | 100.0% |
+| Avg Steps | — | 26 / 100 | 24 / 100 |
 
 ### 4.2 Grid 10x10 (12 obstáculos)
 
-| Métrica | Baseline | Deterministic | Stochastic |
-|---------|----------|---------------|------------|
-| Full Coverage Rate | 59-70% | 0.0% | 8.0% |
-| Avg Coverage | — | 48.4% | **92.9%** |
-| Avg Steps | — | 400 (max) | 394 |
+| Métrica | Baseline | Deterministic | **Stochastic** |
+|---------|----------|---------------|----------------|
+| Full Coverage Rate | 59-70% | 68.0% | **97.0%** ✅ |
+| Avg Coverage | — | 90.2% | 99.7% |
+| Avg Steps | — | 196 / 400 | 117 / 400 |
 
 ### 4.3 Grid 20x20 (48 obstáculos) — bônus
 
-| Métrica | Deterministic | Stochastic |
-|---------|---------------|------------|
-| Full Coverage Rate | 0.0% | 0.0% |
-| Avg Coverage | 14.2% | **93.1%** |
-| Avg Steps | 1600 (max) | 1600 (max) |
+| Métrica | Deterministic | **Stochastic** |
+|---------|---------------|----------------|
+| Full Coverage Rate | 6.0% | **97.0%** ✅ |
+| Avg Coverage | 67.5% | 99.0% |
+| Avg Steps | 1529 / 1600 | 581 / 1600 |
 
-**Síntese:** em modo stochastic o agente atinge **avg coverage 99% / 93% / 93%** em 5x5 / 10x10 / 20x20 — uma melhoria substancial sobre a baseline (75-81% em 5x5, 59-70% em 10x10) e qualifica como "cobertura próxima de 100%" pela métrica de coverage médio. A baseline degrada catastroficamente em 20x20 (não há experimentos do enunciado nesse tamanho); a v3.1 mantém **93% mesmo no grid bônus** — generalização real para um problema com observabilidade parcial e 4× mais células livres que o 10x10.
+**Síntese:** em modo stochastic o agente atinge **100% / 97% / 97% full coverage rate** em 5x5 / 10x10 / 20x20. Avg coverage stochastic é **100% / 99.7% / 99.0%**. Os 3% de "fail" no 10x10/20x20 ainda mostram avg coverage 99% — o agente fecha quase tudo em quase todos os episódios. Atende com folga "cobertura próxima de 100%" pelo critério da rubric.
 
-Curvas de treino (TensorBoard em `log/`): `ep_rew_mean` cresceu monotonicamente, `entropy_loss` ~-0.9 a -1.2 (sem colapso de exploração), `explained_variance` > 0.9 nos três tamanhos — critic confiante na sua estimativa de valor.
+Curvas de treino (TensorBoard em `log/`):
+- `entropy_loss` final: 5x5 -0.143 / 10x10 ~-0.4 / 20x20 -0.443 (política decisiva mas não saturada)
+- `explained_variance` final: 0.985 / 0.97 / 0.99 (critic confiante)
+- `value_loss` final: 0.92 / ~7 / 23 (escala saudável com size, não artificialmente baixo como em colapso)
+- `clip_fraction`: 0.05-0.10 ao final (atualizações modestas, política convergiu)
 
-## 5. Análise
+## 5. Análise — iteração v1 → v3.7 e o que funcionou
 
-**O que funcionou bem.** O agente em modo stochastic chegou a avg coverage de **99% / 93% / 93%** em 5x5 / 10x10 / 20x20 — uma melhoria expressiva sobre a baseline (75-81% / 59-70% / sem dado) e atende ao critério de "cobertura próxima de 100%" pela métrica de coverage médio. O critic atingiu `explained_variance > 0.9` em todos os tamanhos, o que indica que a representação `agent + neighbors + visited_map` é suficientemente rica para capturar o valor de longo prazo dos estados sob observabilidade parcial. A combinação `visited_map` (memória explícita) + sensor 5x5 (descoberta local) + action masking restrito a fronteiras converge em CPU ~6× mais rápido que a abordagem RecurrentPPO+LSTM testada em uma iteração anterior. O 5x5 ainda atinge 87% full coverage em stochastic, superando o teto da baseline.
+### 5.1 O que travou nas iterações intermediárias
 
-**Onde o policy pode melhorar (full coverage 100%).** Em 10x10 e 20x20 o agente cobre rapidamente 90-95% do grid e então fica em loop nas últimas 5-7% de células — o full coverage rate fica em 0-8% em modo deterministic e baixo em stochastic. Três fatores explicam isso à luz da teoria de RL:
-1. **Sinal de objetivo escasso na fase final.** O bônus de cobertura completa (+20 em 10x10, +40 em 20x20) só é gerado em episódios que terminam. Como esses episódios são raros no início do treino, o gradiente do objetivo final chega muito devagar à política — clássico problema de *sparse terminal reward* em tarefas de cobertura.
-2. **Sub-aproveitamento de timesteps.** O `clip_fraction` ainda estava em 0.22-0.26 ao final do 20x20 — sinal de que o policy continuava se atualizando substancialmente. Mais 2-3M timesteps em 10x10 / 20x20 provavelmente fechariam essa lacuna.
-3. **Loops de simetria em deterministic.** Em ambientes parcialmente observáveis a política ótima frequentemente é estocástica; em deterministic mode, simetrias do `visited_map` fazem o `argmax` repetir a mesma trajetória ineficiente. Esse efeito é teoricamente esperado e empiricamente confirmado pelo gap entre as duas colunas.
+| Versão | Problema | Lição |
+|--------|----------|-------|
+| v1 (RecurrentPPO+LSTM) | Curriculum 5x5→10x10 colapsou (`ep_rew_mean` +25 → -208) | LSTM em CPU = lento + frágil; preferir memória explícita |
+| v3 (mask global) | `obstacle_mask` global revelava obstáculos não vistos | Violava partial obs; voltei pra sensor-only |
+| v3.3 (reward hacking) | Bônus 90/95/98% + trunc penalty fez agente "evitar fechar" pra evitar penalty | Reward shaping não-potencial pode mudar política ótima |
+| v3.5 (visited_map global) | `value_loss=1, EV=0.999` — *parecia* perfeito; 10x10 deu 9% | Critic confiante ≠ policy boa. Atalho do critic colapsa policy |
+| v3.6 (minimalist) | Pipeline + 3 polishes travaram em 67% no 10x10 | Polish ataca decisão (entropy); problema era informação |
 
-**Limitações da abordagem.** Modelo é size-specific (cada grid tem o seu); a avaliação depende fortemente do modo stochastic; obstáculos uniformes podem não cobrir configurações patológicas como corredores estreitos.
+### 5.2 O insight final (v3.7)
 
-**Lição da iteração inicial.** A primeira tentativa usou RecurrentPPO+LSTM com curriculum 5x5→10x10 e colapsou (`ep_rew_mean` foi de +25 para -208 em 1.5M timesteps), porque a política 5x5 já tinha entropia baixa demais para se readaptar a 88 células livres. A troca de memória implícita (LSTM com BPTT) por memória explícita (`visited_map` + CNN) resolveu o problema de estabilidade e tornou o treino viável em CPU.
+Conversa no WhatsApp da turma com o colega Rodrigo Medeiros (que tirou sucesso): "Ignorar layouts inalcançáveis e adicionar mais informação pro agente — distância pra fronteira". E Pedro Civita confirmou em aula com o professor que o filtro de solvability é permitido na geração do ambiente.
 
-**Restrições de infraestrutura como motor de design.** O treino foi feito em CPU (Lenovo Yoga Book 9i, 14 cores, sem GPU): RecurrentPPO+LSTM rodava a ~45 FPS nessa máquina, contra ~250 FPS estimados em uma T4. Cheguei a iniciar o v1 em Google Colab Free com T4, mas a sessão é instável para runs longos (~7h sem garantia de manter o kernel) e o curriculum colapsou (acima) — abandonei a rota GPU para focar em arquitetura. As escolhas de design da v3.1 — eliminar LSTM, reduzir feature maps com `stride=2`, capar `n_epochs=6`, paralelizar 12 envs e limitar `torch.set_num_threads=3` — foram pensadas explicitamente para **maximizar throughput em CPU**, e o resultado (6× speedup, pipeline em 2h03min) viabilizou o experimento sem dependência externa. Em GPU equivalente o mesmo pipeline rodaria em ~25 min, o que viabilizaria 15M+ timesteps em 10×10/20×20 no mesmo orçamento de tempo — provavelmente fechando os 5-10% de cobertura que ainda escapam.
+Diagnóstico final do v3.6: o agente conseguia avg 99.3% no 10x10 mas full=67% porque (1) ~30% dos layouts eram impossíveis de fechar e (2) com 1 célula faltando, ratio direcional ≈ 1/50 = 2% — sinal fraco demais pra política comprometer. **Polish bateu no teto** porque atacava decisão (entropy), não informação.
 
-**Caminhos para fechar 100% full coverage.** (i) Continue-training com +2-3M timesteps em 10x10 / 20x20 a partir do checkpoint final, mantendo todos os hyperparams. (ii) Reward shaping com bônus parciais (+1.0 por atingir 25%, 50%, 75% de coverage), distribuindo o sinal de objetivo ao longo do episódio em vez de concentrá-lo na cobertura completa. (iii) Curriculum suave 5x5 → 7x7 → 10x10 com LR reduzido na transferência (a versão original falhou por LR alto em ajuste fino).
+v3.7 ataca a causa real:
+1. **Compass `(dx, dy, dist)`**: vetor unitário pra célula não-visitada mais próxima (excluindo obstáculos conhecidos). Quando sobra 1 célula 8 longe: compass = (0.8, 0, 0.4) — sinal **40× mais forte** que o ratio.
+2. **Solvability filter**: BFS de alcançabilidade no `reset()`, regenera até layout válido. Elimina ~30% dos 10x10 e ~80% dos 20x20 que tinham pockets cercadas.
+3. **ent_coef=0.01 desde 10x10**: v3.6 usava 0.05 no curriculum pra "amaciar transfer", mas isso travava a política em alta entropia. v3.7 usa 0.01 desde o começo — política comprime decisivamente sem perder estabilidade.
 
-## 6. Como reproduzir
+### 5.3 Sinais de saúde (v3.7 vs v3.6)
+
+| Sinal | v3.6 5x5 final | **v3.7 5x5 final** |
+|-------|---------------|---------------|
+| `entropy_loss` | -0.75 | **-0.143** (5× mais decisivo) |
+| FPS treino | 1257 | **1694** (35% mais rápido) |
+| Stoch Full | 92% | **100%** |
+
+A drop em entropy_loss é a smoking gun: com compass + solvability filter, a ação ótima vira óbvia em todo estado, e a política colapsa pra "siga o compass". Isso explica porque o **deterministic** mode também pula de 21% (v3.6 5x5) pra 97% — o `argmax` agora é confiável, não preso em loops por uniformidade.
+
+### 5.4 Limitações restantes
+
+- Modelo é treinado num pipeline curriculum 5x5→10x10→20x20 — não foi testado generalização zero-shot pra outros tamanhos.
+- O filtro de solvability rejeita layouts impossíveis na avaliação — métrica final é "full coverage condicional a layout válido", não "full coverage incondicional". Decisão documentada e aprovada pelo professor.
+- 20x20 deterministic = 6%. O `argmax` ainda cai em loops específicos no grid grande; **stochastic = 97%** é a métrica primária.
+
+## 6. Métodos avaliados e não escolhidos
+
+| Método | Por que não usei |
+|--------|------------------|
+| RecurrentPPO+LSTM (v1) | Tentei na primeira iteração; LSTM em CPU é 5-10× mais lento que feedforward; instável em curriculum |
+| DQN com action masking custom | Action masking não nativo no DQN do SB3; risco de não convergir; sem ganho esperado vs MaskablePPO |
+| Maskable Recurrent PPO | sb3-contrib não tem essa classe; implementação custom complexa em prazo curto |
+| Frame stacking (VecFrameStack) | Considerado como fallback; v3.7 fechou 90%+ sem precisar — adiar |
+| Aumentar capacity da rede | Não muda fundamentos; provavelmente não resolveria gap de informação |
+| Curriculum granular 5→7→10→13→17→20 | Mais stages = mais tempo; v3.7 com 3 stages bastou |
+| Reward intrinsic motivation (RND, count-based) | Implementação complexa; resultados em v3.7 dispensam |
+| Hierarchical RL / MAML / Rainbow DQN | Custo/risco proibitivo perto do deadline |
+| Imitation learning + BFS teacher | Borderline com restrição "não usar BFS no policy"; v3.7 mostra que não é necessário |
+
+## 7. Como reproduzir
 
 ```powershell
-python -m venv venv ; .\venv\Scripts\Activate.ps1 ; pip install -r requirements.txt
-python train_local_pipeline.py 5 10 20 --skip-test    # ~2h em CPU 14 cores
-python finalize.py                                    # roda testes, preenche este relatório, faz commit
+# Setup
+git clone https://github.com/pedrocivita/gym_custom_env-pedrotpc
+cd gym_custom_env-pedrotpc
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Treinar pipeline v3.7 (~70 min em CPU 14 cores)
+.\venv\Scripts\python.exe train_v37_pipeline.py --skip-test
+
+# Avaliar (100 det + 100 stoch episódios em cada size, ~5 min)
+.\venv\Scripts\python.exe train_grid_world_cpp.py test 5 3
+.\venv\Scripts\python.exe train_grid_world_cpp.py test 10 12
+.\venv\Scripts\python.exe train_grid_world_cpp.py test 20 48
 ```
 
-Modelos salvos em `data/maskppo_cpp_<size>_*.zip`; checkpoints em `data/maskppo_cpp_..._checkpoints/`.
+**Modelos finais salvos em `data/`:**
+- `maskppo_cpp_5_3_200_<timestamp>.zip` — 5x5 scratch
+- `maskppo_cpp_10_12_600_<timestamp>_curr.zip` — 10x10 curriculum
+- `maskppo_cpp_20_48_2000_<timestamp>_curr.zip` — 20x20 curriculum
+
+`test_mode` pega automaticamente o modelo mais recente que casa com `(size, obstacles)`.
+
+**Logs TensorBoard em `log/`:**
+```powershell
+.\venv\Scripts\tensorboard.exe --logdir log
+```
+
+---
+
+**Histórico completo das iterações** (v1 → v3.7) está em `EXPERIMENT_LOG.md`.
