@@ -57,7 +57,7 @@ gym_custom_env-pedrotpc/
 ├── finalize.py                         # Roda testes + atualiza report + commita
 ├── report_cpp.md                       # Relatório principal
 ├── EXPERIMENT_LOG.md                   # Histórico v1 → v3.7
-├── data/                               # Modelos treinados (versionados)
+├── data/                               # Modelos treinados (gitignored, ver Releases)
 └── log/                                # TensorBoard / CSV (gitignored)
 ```
 
@@ -115,6 +115,8 @@ maskppo_cpp_20_48_2000_<timestamp>_curr.zip    # 20x20 curriculum v3.7
 ```
 
 `test_mode` pega automaticamente o modelo mais recente que casa com `(size, obstacles)`.
+
+Os `.zip` dos modelos não ficam mais no git. Baixe os modelos finais na página de [Releases](https://github.com/pedrocivita/gym_custom_env-pedrotpc/releases) e coloque em `data/` antes de rodar `test_mode`, ou treine de novo com os comandos acima.
 
 ---
 
